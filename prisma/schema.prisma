@@ -241,11 +241,24 @@ model Product {
   id            String    @id @default(cuid())
   categoryId    String
   subcategoryId String?
+  brandId       String?
   name          String
   nameAr        String
   description   String?   @db.Text
   descriptionAr String?   @db.Text
   imageUrl      String?   @db.Text
+
+  // Flattened product-level commerce fields (Phase 1). New products write
+  // here directly; legacy products are backfilled from their canonical
+  // variant by `prisma/backfill-products.ts`. `sku` is uniquely indexed
+  // — MySQL permits multiple NULLs on a UNIQUE column so legacy rows are
+  // tolerated until backfill runs.
+  sku           String?   @unique
+  barcode       String?
+  price         Decimal?  @db.Decimal(10, 2)
+  stock         Int       @default(0)
+  reserved      Int       @default(0)
+
   isActive      Boolean   @default(true)
   isFeatured    Boolean   @default(false)
   hideFromHome  Boolean   @default(false)
@@ -254,17 +267,45 @@ model Product {
 
   category      Category      @relation(fields: [categoryId], references: [id])
   subcategory   Subcategory?  @relation(fields: [subcategoryId], references: [id])
+  brand         Brand?        @relation(fields: [brandId], references: [id], onDelete: SetNull)
   variants      ProductVariant[]
   favorites     Favorite[]
   promotions    Promotion[]   @relation("ProductPromotions")
   featuredItems FeaturedSectionItem[]
+  orderItems    OrderItem[]   @relation("ProductOrderItems")
 
   @@index([categoryId])
   @@index([subcategoryId])
+  @@index([brandId])
   @@index([isActive])
   @@index([isFeatured])
   @@index([hideFromHome])
+  @@index([barcode])
   @@map("products")
+}
+
+// ─── Brands ───────────────────────────────────────────────────────
+//
+// Phase 1: minimal Brand entity. CRUD endpoints are wired so the future
+// admin UI can manage brands without a follow-up backend release. Every
+// Product belongs to one Brand (FK nullable for transitional safety;
+// the application-layer schema requires it for new products).
+
+model Brand {
+  id        String   @id @default(cuid())
+  name      String
+  nameAr    String
+  slug      String   @unique
+  imageUrl  String?  @db.Text
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  products  Product[]
+
+  @@index([isActive])
+  @@map("brands")
 }
 
 model ProductVariant {
@@ -396,7 +437,16 @@ model PickupTimeSlot {
 model OrderItem {
   id               String          @id @default(cuid())
   orderId          String
-  variantId        String
+  // Phase 6: orders are product-keyed. `variantId` is kept nullable for
+  // legacy orders placed before flat products; new orders set `productId`
+  // and snapshot SKU/barcode/names so the row still renders if the
+  // product is later deleted or renamed.
+  variantId        String?
+  productId        String?
+  productSku       String?
+  productBarcode   String?
+  productName      String?
+  productNameAr    String?
   quantity         Int
   unitPrice        Decimal         @db.Decimal(10, 2)
   discountedPrice  Decimal?        @db.Decimal(10, 2)
@@ -407,11 +457,13 @@ model OrderItem {
   notes            String?
   createdAt        DateTime        @default(now())
 
-  order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  variant ProductVariant @relation(fields: [variantId], references: [id])
+  order   Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
+  product Product?        @relation("ProductOrderItems", fields: [productId], references: [id], onDelete: SetNull)
 
   @@index([orderId])
   @@index([variantId])
+  @@index([productId])
   @@map("order_items")
 }
 
@@ -568,6 +620,10 @@ model DeliveryPricingSettings {
   freeDeliveryThreshold      Decimal? @db.Decimal(10, 2)
   thresholdForSubscribers    Boolean  @default(true)
   thresholdForNonSubscribers Boolean  @default(true)
+  // Multiplier applied to the great-circle (haversine) distance to
+  // approximate driving distance. 1.00 = use straight-line as-is.
+  // Typical urban factors: 1.30–1.45. Caps to two decimals.
+  roadDistanceMultiplier     Decimal  @db.Decimal(4, 2) @default(1.00)
   updatedAt                  DateTime @updatedAt
 
   @@map("delivery_pricing_settings")

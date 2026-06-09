@@ -1,6 +1,11 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
-import { CreateProductInput, UpdateProductInput } from './product.schema';
+import { assertBrandExists } from '../brands/brand.service';
+import {
+  AdjustStockInput,
+  CreateProductInput,
+  UpdateProductInput,
+} from './product.schema';
 
 /**
  * Standard paginated payload. Returns the new ninja-style fields
@@ -17,16 +22,22 @@ export function buildPagination(page: number, limit: number, total: number) {
     totalPages,
     hasNextPage: page < totalPages,
     hasPreviousPage: page > 1,
-    // Legacy keys retained for backwards-compatible callers.
     limit,
     total,
     pages: totalPages,
   };
 }
 
+const PRODUCT_INCLUDE = {
+  category: { select: { id: true, name: true, nameAr: true, slug: true } },
+  subcategory: { select: { id: true, name: true, nameAr: true, slug: true } },
+  brand: { select: { id: true, name: true, nameAr: true, slug: true } },
+} as const;
+
 export interface ProductListOptions {
   categoryId?: string;
   subcategoryId?: string;
+  brandId?: string;
   featured?: boolean;
   search?: string;
   page?: number;
@@ -36,10 +47,18 @@ export interface ProductListOptions {
   excludeHiddenFromHome?: boolean;
 }
 
+/**
+ * Phase 1 list: filters now run against product-level fields. The OOS gate
+ * uses `product.stock - product.reserved > 0` so legacy products that have
+ * not been backfilled yet are excluded from customer browsing (their stock
+ * defaults to 0 until the backfill script copies values from the canonical
+ * variant).
+ */
 export async function listProducts(opts: ProductListOptions = {}) {
   const {
     categoryId,
     subcategoryId,
+    brandId,
     featured,
     search,
     page = 1,
@@ -54,18 +73,19 @@ export async function listProducts(opts: ProductListOptions = {}) {
     ...(excludeHiddenFromHome && { hideFromHome: false }),
     ...(categoryId && { categoryId }),
     ...(subcategoryId && { subcategoryId }),
+    ...(brandId && { brandId }),
     ...(featured !== undefined && { isFeatured: featured }),
     ...(search && {
       OR: [
         { name: { contains: search } },
         { nameAr: { contains: search } },
-        { variants: { some: { sku: { contains: search } } } },
-        { variants: { some: { barcode: { contains: search } } } },
+        { sku: { contains: search } },
+        { barcode: { contains: search } },
       ],
     }),
     // Browsing hides products with zero available stock; admin / search bypasses this.
     ...(!includeInactive && !includeOutOfStock && {
-      variants: { some: { isActive: true, stock: { gt: 0 } } },
+      stock: { gt: 0 },
     }),
   };
 
@@ -74,57 +94,77 @@ export async function listProducts(opts: ProductListOptions = {}) {
       where,
       skip: (page - 1) * limit,
       take: limit,
-      include: {
-        category: { select: { id: true, name: true, nameAr: true } },
-        subcategory: { select: { id: true, name: true, nameAr: true } },
-        variants: {
-          where: includeInactive ? {} : { isActive: true },
-          orderBy: { price: 'asc' },
-        },
-      },
+      include: PRODUCT_INCLUDE,
       orderBy: { createdAt: 'desc' },
     }),
     prisma.product.count({ where }),
   ]);
 
   return {
-    products,
+    products: products.map(annotateAvailability),
     pagination: buildPagination(page, limit, total),
   };
 }
 
 export async function getProductById(id: string) {
-  return prisma.product.findUnique({
+  const product = await prisma.product.findUnique({
     where: { id },
-    include: {
-      category: true,
-      subcategory: true,
-      variants: { where: { isActive: true }, orderBy: { price: 'asc' } },
-    },
+    include: PRODUCT_INCLUDE,
   });
+  return product ? annotateAvailability(product) : null;
 }
 
 export async function createProduct(data: CreateProductInput) {
-  const { variants, ...productData } = data;
+  await assertBrandExists(data.brandId);
+  await ensureSkuUnique(data.sku);
   return prisma.product.create({
     data: {
-      ...productData,
-      variants: {
-        create: variants.map((v) => ({
-          type: v.type,
-          sku: v.sku,
-          barcode: v.barcode,
-          price: v.price,
-          stock: v.stock,
-        })),
-      },
+      categoryId: data.categoryId,
+      subcategoryId: data.subcategoryId,
+      brandId: data.brandId,
+      name: data.name,
+      nameAr: data.nameAr,
+      description: data.description,
+      descriptionAr: data.descriptionAr,
+      sku: data.sku,
+      barcode: data.barcode,
+      price: data.price,
+      stock: data.quantity,
+      isFeatured: data.isFeatured,
+      hideFromHome: data.hideFromHome,
     },
-    include: { variants: true },
+    include: PRODUCT_INCLUDE,
   });
 }
 
 export async function updateProduct(id: string, data: UpdateProductInput) {
-  return prisma.product.update({ where: { id }, data });
+  if (data.brandId) await assertBrandExists(data.brandId);
+  if (data.sku) await ensureSkuUnique(data.sku, id);
+
+  const payload: Prisma.ProductUpdateInput = {};
+  if (data.categoryId !== undefined) payload.category = { connect: { id: data.categoryId } };
+  if (data.subcategoryId !== undefined) {
+    payload.subcategory = data.subcategoryId
+      ? { connect: { id: data.subcategoryId } }
+      : { disconnect: true };
+  }
+  if (data.brandId !== undefined) payload.brand = { connect: { id: data.brandId } };
+  if (data.name !== undefined) payload.name = data.name;
+  if (data.nameAr !== undefined) payload.nameAr = data.nameAr;
+  if (data.description !== undefined) payload.description = data.description;
+  if (data.descriptionAr !== undefined) payload.descriptionAr = data.descriptionAr;
+  if (data.sku !== undefined) payload.sku = data.sku;
+  if (data.barcode !== undefined) payload.barcode = data.barcode;
+  if (data.price !== undefined) payload.price = data.price;
+  if (data.quantity !== undefined) payload.stock = data.quantity;
+  if (data.isFeatured !== undefined) payload.isFeatured = data.isFeatured;
+  if (data.hideFromHome !== undefined) payload.hideFromHome = data.hideFromHome;
+
+  return prisma.product.update({
+    where: { id },
+    data: payload,
+    include: PRODUCT_INCLUDE,
+  });
 }
 
 export async function toggleProductStatus(id: string, isActive: boolean) {
@@ -135,59 +175,52 @@ export async function deleteProduct(id: string) {
   return prisma.product.delete({ where: { id } });
 }
 
-export async function createVariant(productId: string, data: {
-  type: 'PIECE' | 'CARTON' | 'DOZEN' | 'BUNDLE';
-  sku: string;
-  barcode?: string;
-  price: number;
-  stock: number;
-}) {
-  return prisma.productVariant.create({ data: { ...data, productId } });
-}
-
-export async function updateVariant(id: string, data: Partial<{
-  price: number;
-  stock: number;
-  barcode: string;
-  isActive: boolean;
-}>) {
-  return prisma.productVariant.update({ where: { id }, data });
-}
-
-export async function adjustStock(variantId: string, delta: number) {
-  return prisma.productVariant.update({
-    where: { id: variantId },
-    data: { stock: { increment: delta } },
+/**
+ * Adjust stock at the product level. Supports either a signed `delta`
+ * (increment/decrement) or an absolute `set` value. Stock cannot go
+ * negative when using `delta`.
+ */
+export async function adjustProductStock(productId: string, input: AdjustStockInput) {
+  if (input.set !== undefined) {
+    return prisma.product.update({
+      where: { id: productId },
+      data: { stock: input.set },
+    });
+  }
+  const delta = input.delta!;
+  return prisma.$transaction(async (tx) => {
+    const current = await tx.product.findUnique({ where: { id: productId }, select: { stock: true } });
+    if (!current) throw new Error('Product not found');
+    const next = current.stock + delta;
+    if (next < 0) throw new Error('Stock cannot go negative');
+    return tx.product.update({ where: { id: productId }, data: { stock: next } });
   });
 }
 
 export async function getFeaturedProducts() {
-  return prisma.product.findMany({
+  const products = await prisma.product.findMany({
     where: {
       isActive: true,
       isFeatured: true,
-      variants: { some: { isActive: true, stock: { gt: 0 } } },
+      stock: { gt: 0 },
     },
-    include: {
-      category: { select: { id: true, name: true, nameAr: true } },
-      subcategory: { select: { id: true, name: true, nameAr: true } },
-      variants: { where: { isActive: true }, orderBy: { price: 'asc' } },
-    },
+    include: PRODUCT_INCLUDE,
     take: 20,
   });
+  return products.map(annotateAvailability);
 }
 
 // ─── Smart search ──────────────────────────────────────────────────
 
-const annotateAvailability = <P extends { variants: { stock: number; reserved: number; isActive: boolean }[] }>(
-  product: P
-) => {
-  const variantsWithAvail = product.variants.map((v) => ({
-    ...v,
-    available: v.isActive && v.stock - v.reserved > 0,
-  }));
-  const anyAvailable = variantsWithAvail.some((v) => v.available);
-  return { ...product, variants: variantsWithAvail, available: anyAvailable };
+type ProductWithStock = {
+  stock: number;
+  reserved: number;
+  isActive: boolean;
+};
+
+const annotateAvailability = <P extends ProductWithStock>(product: P): P & { available: boolean } => {
+  const available = product.isActive && product.stock - product.reserved > 0;
+  return { ...product, available };
 };
 
 export async function searchProducts(opts: {
@@ -200,30 +233,24 @@ export async function searchProducts(opts: {
   const page = Math.max(1, opts.page ?? 1);
   const limit = Math.max(1, Math.min(100, opts.limit ?? 20));
 
-  // Barcode lookup: exact match on any variant. Single result by design.
+  // Barcode lookup: exact match against the product-level barcode. Single result
+  // by design — barcodes are practically unique even though we don't enforce it
+  // in SQL (some products share GS1 lookups via packaging).
   if (barcode && barcode.trim()) {
-    const variant = await prisma.productVariant.findFirst({
-      where: { barcode: barcode.trim(), isActive: true, product: { isActive: true } },
-      include: {
-        product: {
-          include: {
-            category: { select: { id: true, name: true, nameAr: true } },
-            subcategory: { select: { id: true, name: true, nameAr: true } },
-            variants: { where: { isActive: true }, orderBy: { price: 'asc' } },
-          },
-        },
-      },
+    const product = await prisma.product.findFirst({
+      where: { barcode: barcode.trim(), isActive: true },
+      include: PRODUCT_INCLUDE,
     });
-    if (!variant) {
+    if (!product) {
       return {
         products: [],
-        matchedVariantId: null,
+        matchedProductId: null,
         pagination: buildPagination(1, limit, 0),
       };
     }
     return {
-      products: [annotateAvailability(variant.product)],
-      matchedVariantId: variant.id,
+      products: [annotateAvailability(product)],
+      matchedProductId: product.id,
       pagination: buildPagination(1, limit, 1),
     };
   }
@@ -232,7 +259,7 @@ export async function searchProducts(opts: {
   if (!term) {
     return {
       products: [],
-      matchedVariantId: null,
+      matchedProductId: null,
       pagination: buildPagination(page, limit, 0),
     };
   }
@@ -242,8 +269,8 @@ export async function searchProducts(opts: {
     OR: [
       { name: { contains: term } },
       { nameAr: { contains: term } },
-      { variants: { some: { sku: { contains: term } } } },
-      { variants: { some: { barcode: { contains: term } } } },
+      { sku: { contains: term } },
+      { barcode: { contains: term } },
     ],
   };
 
@@ -252,37 +279,31 @@ export async function searchProducts(opts: {
       where,
       skip: (page - 1) * limit,
       take: limit,
-      include: {
-        category: { select: { id: true, name: true, nameAr: true } },
-        subcategory: { select: { id: true, name: true, nameAr: true } },
-        variants: { where: { isActive: true }, orderBy: { price: 'asc' } },
-      },
-      // Featured first, then deterministic id order so paging is stable.
+      include: PRODUCT_INCLUDE,
       orderBy: [{ isFeatured: 'desc' }, { id: 'asc' }],
     }),
     prisma.product.count({ where }),
   ]);
 
-  // Sort: in-stock first, then OOS — matches "show product, disabled add for OOS"
   const annotated = products.map(annotateAvailability);
   annotated.sort((a, b) => Number(b.available) - Number(a.available));
 
   return {
     products: annotated,
-    matchedVariantId: null,
+    matchedProductId: null,
     pagination: buildPagination(page, limit, total),
   };
 }
 
-export async function listLowStockVariants(threshold = 5) {
-  return prisma.productVariant.findMany({
+export async function listLowStockProducts(threshold = 5) {
+  return prisma.product.findMany({
     where: {
       isActive: true,
       stock: { lte: threshold },
-      product: { isActive: true },
     },
     include: {
-      product: { select: { id: true, name: true, nameAr: true, imageUrl: true } },
+      category: { select: { id: true, name: true, nameAr: true } },
+      brand: { select: { id: true, name: true, nameAr: true } },
     },
     orderBy: { stock: 'asc' },
     take: 100,
@@ -292,7 +313,7 @@ export async function listLowStockVariants(threshold = 5) {
 export async function searchSuggestions(q: string, limit = 8) {
   const term = q.trim();
   if (!term) return [];
-  const products = await prisma.product.findMany({
+  return prisma.product.findMany({
     where: {
       isActive: true,
       OR: [
@@ -300,9 +321,21 @@ export async function searchSuggestions(q: string, limit = 8) {
         { nameAr: { contains: term } },
       ],
     },
-    select: { id: true, name: true, nameAr: true, imageUrl: true },
+    select: { id: true, name: true, nameAr: true, imageUrl: true, sku: true },
     take: limit,
     orderBy: { isFeatured: 'desc' },
   });
-  return products;
+}
+
+// ─── Internal helpers ──────────────────────────────────────────────
+
+async function ensureSkuUnique(sku: string, ignoreProductId?: string): Promise<void> {
+  const existing = await prisma.product.findFirst({
+    where: {
+      sku,
+      ...(ignoreProductId && { NOT: { id: ignoreProductId } }),
+    },
+    select: { id: true },
+  });
+  if (existing) throw new Error(`SKU "${sku}" is already in use by another product`);
 }

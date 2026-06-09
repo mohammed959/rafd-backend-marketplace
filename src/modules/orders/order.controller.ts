@@ -332,16 +332,16 @@ export async function setItemStatus(req: AuthRequest, res: Response): Promise<vo
 }
 
 export async function replaceItem(req: AuthRequest, res: Response): Promise<void> {
-  const { variantId, quantity } = req.body as { variantId?: string; quantity?: number };
-  if (typeof variantId !== 'string' || !variantId) {
-    badRequest(res, 'variantId is required');
+  const { productId, quantity } = req.body as { productId?: string; quantity?: number };
+  if (typeof productId !== 'string' || !productId) {
+    badRequest(res, 'productId is required');
     return;
   }
   try {
     const data = await svc.replaceOrderItem(
       req.params.id,
       req.params.itemId,
-      variantId,
+      productId,
       typeof quantity === 'number' ? quantity : undefined,
       req.user!
     );

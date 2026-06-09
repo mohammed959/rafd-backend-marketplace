@@ -54,7 +54,9 @@ router.delete('/cancel', authenticateCustomer, asyncHandler(async (req: AuthRequ
 
 // Admin (staff only)
 router.get('/admin/plans', authenticateStaff, asyncHandler(async (_req, res) => {
-  ok(res, await svc.getPlans(false));
+  // Admin view always includes subscriber counts so the UI can render
+  // "X subscribers" + gate the deactivate toggle.
+  ok(res, await svc.getPlans(false, true));
 }));
 
 router.post('/admin/plans', authenticateStaff, asyncHandler(async (req, res) => {
@@ -67,7 +69,11 @@ router.put('/admin/plans/:id', authenticateStaff, asyncHandler(async (req, res) 
 }));
 
 router.patch('/admin/plans/:id/status', authenticateStaff, asyncHandler(async (req, res) => {
-  ok(res, await svc.togglePlan(req.params.id, req.body.isActive));
+  try {
+    ok(res, await svc.togglePlan(req.params.id, req.body.isActive));
+  } catch (err) {
+    badRequest(res, (err as Error).message);
+  }
 }));
 
 router.get('/admin/subscribers', authenticateStaff, asyncHandler(async (req, res) => {
@@ -75,13 +81,27 @@ router.get('/admin/subscribers', authenticateStaff, asyncHandler(async (req, res
   const status = typeof req.query.status === 'string'
     ? (req.query.status as 'PENDING_PAYMENT' | 'ACTIVE' | 'EXPIRED' | 'CANCELLED')
     : undefined;
-  const data = await svc.listSubscribers({ page, status });
+  const planId = typeof req.query.planId === 'string' ? req.query.planId : undefined;
+  const data = await svc.listSubscribers({ page, status, planId });
   ok(res, data);
 }));
 
 router.patch('/admin/:id/confirm', authenticateStaff, asyncHandler(async (req: AuthRequest, res) => {
   const data = await svc.confirmSubscription(req.params.id, req.user!.userId);
   ok(res, data, 'Subscription activated');
+}));
+
+/**
+ * Admin-side cancel: remove a specific customer from their plan. Used by
+ * the admin Subscribers tab's per-row "Remove" action.
+ */
+router.delete('/admin/:id', authenticateStaff, asyncHandler(async (req: AuthRequest, res) => {
+  try {
+    const data = await svc.cancelSubscriptionById(req.params.id, req.user!.userId);
+    ok(res, data, 'Subscription cancelled');
+  } catch (err) {
+    badRequest(res, (err as Error).message);
+  }
 }));
 
 export default router;

@@ -21,16 +21,24 @@ export async function listSections(activeOnly = true) {
   });
 
   // When activeOnly, drop products that are inactive / out of stock so the
-  // section quietly hides them on the customer home.
+  // section quietly hides them on the customer home. Phase 5+ flat products
+  // carry stock at the product level; legacy rows still resolve through
+  // their variants until the backfill completes.
   if (activeOnly) {
+    const inStock = (product: {
+      isActive: boolean;
+      stock: number;
+      reserved: number;
+      variants: { isActive: boolean; stock: number; reserved: number }[];
+    }) => {
+      if (!product.isActive) return false;
+      if (product.stock - product.reserved > 0) return true;
+      return product.variants.some((v) => v.isActive && v.stock - v.reserved > 0);
+    };
     return sections
       .map((s) => ({
         ...s,
-        items: s.items.filter(
-          (it) =>
-            it.product.isActive &&
-            it.product.variants.some((v) => v.isActive && v.stock - v.reserved > 0)
-        ),
+        items: s.items.filter((it) => inStock(it.product)),
       }))
       .filter((s) => s.items.length > 0);
   }

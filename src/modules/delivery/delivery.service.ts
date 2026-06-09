@@ -16,7 +16,12 @@ function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): nu
 export interface DeliveryQuoteResult {
   branchConfigured: boolean;
   deliveryEnabled: boolean;
+  /** Distance used for rule matching: straight-line × roadDistanceMultiplier. */
   distanceKm: number | null;
+  /** Raw great-circle distance from the haversine formula, for transparency. */
+  straightLineKm: number | null;
+  /** Multiplier the admin set to approximate road distance. 1.00 = unchanged. */
+  roadDistanceMultiplier: number;
   fee: number;
   /** Home delivery is allowed for this customer. False ⇒ frontend must hide
    *  delivery and Cash-on-Delivery, and the backend will reject delivery orders. */
@@ -65,10 +70,54 @@ interface QuoteOpts {
   customerLat?: number;
   customerLng?: number;
   cartSubtotal?: number;
+  /**
+   * Phase 3: when the customer has selected PICKUP, the quote returns
+   * `fee: 0` and `pricingRuleApplied: 'PICKUP'` — all other fields
+   * (distance, branchConfigured, deliveryAvailable, etc.) are still
+   * computed so the order/checkout layer can decide eligibility. When
+   * omitted, the calc returns the delivery-fee semantics that the cart
+   * has always shown.
+   */
+  fulfillmentType?: 'DELIVERY' | 'PICKUP';
   hasActiveSubscription?: boolean;
   subscriptionBenefitType?: string | null;
   subscriptionDiscountValue?: number | null;
   subscriptionCappedFee?: number | null;
+}
+
+/**
+ * Phase 3: subscription context loader used by every backend caller of
+ * `quoteDelivery` (cart fee endpoint, checkout quote endpoint, and
+ * order creation). Centralising this lookup is what guarantees the
+ * subscription decision is identical at every step — there is no longer
+ * an inline `prisma.customerSubscription.findFirst` in three places.
+ */
+export interface SubscriptionContext {
+  hasActiveSubscription: boolean;
+  subscriptionBenefitType: string | null;
+  subscriptionDiscountValue: number | null;
+  subscriptionCappedFee: number | null;
+}
+
+export async function loadSubscriptionContext(customerId?: string): Promise<SubscriptionContext> {
+  const empty: SubscriptionContext = {
+    hasActiveSubscription: false,
+    subscriptionBenefitType: null,
+    subscriptionDiscountValue: null,
+    subscriptionCappedFee: null,
+  };
+  if (!customerId) return empty;
+  const sub = await prisma.customerSubscription.findFirst({
+    where: { customerId, status: 'ACTIVE', expiryDate: { gt: new Date() } },
+    include: { plan: { select: { benefitType: true, discountValue: true, cappedFee: true } } },
+  });
+  if (!sub) return empty;
+  return {
+    hasActiveSubscription: true,
+    subscriptionBenefitType: sub.plan.benefitType,
+    subscriptionDiscountValue: sub.plan.discountValue ? Number(sub.plan.discountValue) : null,
+    subscriptionCappedFee: sub.plan.cappedFee ? Number(sub.plan.cappedFee) : null,
+  };
 }
 
 /**
@@ -87,16 +136,38 @@ interface QuoteOpts {
  * plan's benefit is the only pricing decision.
  */
 export async function quoteDelivery(opts: QuoteOpts): Promise<DeliveryQuoteResult> {
+  const quote = await computeDeliveryQuote(opts);
+  // Phase 3 single-path consolidation: when the customer (or order
+  // creation flow) declares PICKUP, override the fee in one place rather
+  // than at every caller. Eligibility fields stay intact so the order
+  // layer's gates (branchConfigured / deliveryAvailable / etc.) still
+  // behave as before.
+  if (opts.fulfillmentType === 'PICKUP') {
+    return { ...quote, fee: 0, pricingRuleApplied: 'PICKUP' };
+  }
+  return quote;
+}
+
+async function computeDeliveryQuote(opts: QuoteOpts): Promise<DeliveryQuoteResult> {
   const [settings, branch] = await Promise.all([
     prisma.deliveryPricingSettings.findFirst(),
     prisma.branch.findFirst({ where: { isActive: true } }),
   ]);
 
   const hasActiveSubscription = Boolean(opts.hasActiveSubscription);
+  const rawMultiplier = settings?.roadDistanceMultiplier != null
+    ? Number(settings.roadDistanceMultiplier)
+    : 1;
+  // Defensive: a non-positive or NaN multiplier would make every customer
+  // look like they're at 0 km. Fall back to 1.0 (no adjustment).
+  const roadDistanceMultiplier = Number.isFinite(rawMultiplier) && rawMultiplier > 0 ? rawMultiplier : 1;
+
   const baseQuote: DeliveryQuoteResult = {
     branchConfigured: Boolean(branch),
     deliveryEnabled: settings?.deliveryEnabled ?? true,
     distanceKm: null,
+    straightLineKm: null,
+    roadDistanceMultiplier,
     fee: 0,
     deliveryAvailable: false,
     pickupAvailable: true,
@@ -153,18 +224,23 @@ export async function quoteDelivery(opts: QuoteOpts): Promise<DeliveryQuoteResul
   }
 
   const hasCustomerCoords = opts.customerLat != null && opts.customerLng != null;
-  const distanceKm = hasCustomerCoords
-    ? Math.round(
-        haversineKm(
-          opts.customerLat!,
-          opts.customerLng!,
-          Number(branch.latitude),
-          Number(branch.longitude),
-        ) * 100,
-      ) / 100
-    : null;
+  let straightLineKm: number | null = null;
+  let distanceKm: number | null = null;
+  if (hasCustomerCoords) {
+    const raw = haversineKm(
+      opts.customerLat!,
+      opts.customerLng!,
+      Number(branch.latitude),
+      Number(branch.longitude),
+    );
+    straightLineKm = Math.round(raw * 100) / 100;
+    // Apply admin-controlled road-distance calibration. 1.00 = no change;
+    // 1.30–1.45 are common urban factors that approximate driving distance.
+    distanceKm = Math.round(raw * roadDistanceMultiplier * 100) / 100;
+  }
 
   baseQuote.distanceKm = distanceKm;
+  baseQuote.straightLineKm = straightLineKm;
 
   if (distanceKm == null) {
     // No customer location yet — checkout will prompt for it. We don't preview
@@ -177,13 +253,16 @@ export async function quoteDelivery(opts: QuoteOpts): Promise<DeliveryQuoteResul
     };
   }
 
-  // Hard max-distance gate. Applies to subscribers and non-subscribers.
+  // Hard max-distance gate — Phase 6: this check fires BEFORE the
+  // subscription path, so an out-of-range customer with an active
+  // subscription is still refused home delivery and must use pickup.
+  // Max delivery distance > subscription benefits, by design.
   if (maxDeliveryKm != null && distanceKm > maxDeliveryKm) {
     return {
       ...baseQuote,
       reason: 'OUT_OF_RANGE',
       outOfService: true,
-      message: `Your location is ${distanceKm.toFixed(1)} km away — outside our ${maxDeliveryKm} km delivery coverage. Pickup from Branch is available.`,
+      message: 'Home delivery is unavailable for this address because it exceeds the maximum delivery distance.',
     };
   }
 
@@ -402,22 +481,63 @@ export async function getDeliverySettings() {
   return prisma.deliveryPricingSettings.findFirst();
 }
 
+/**
+ * Phase 2 source-of-truth note:
+ *
+ *   `/admin/branch-coverage` is the canonical admin location for delivery
+ *   configuration. The fields below split into two groups:
+ *
+ *     LIVE — read by `quoteDelivery` and writable via the tightened
+ *     controller schema in `delivery.controller.ts`:
+ *       deliveryEnabled, maxDeliveryKm, distanceRulesEnabled,
+ *       roadDistanceMultiplier, baseFee (subscription path only),
+ *       freeDeliveryEnabled, freeDeliveryThreshold,
+ *       thresholdForNonSubscribers.
+ *
+ *     DEAD — kept here ONLY because the underlying DB columns are
+ *     NOT NULL without `@default`, so the first-ever create needs a
+ *     value. The controller's Zod schema rejects any update path, so
+ *     these stay frozen at the seed values forever and are scheduled
+ *     for removal in Phase 5 (destructive `DROP COLUMN` migration):
+ *       distancePricingEnabled, feePerKm, minimumFee, maximumFee,
+ *       thresholdForSubscribers.
+ */
 const SETTINGS_DEFAULTS = {
+  // ── LIVE (read by quoteDelivery) ─────────────────────────────────
   deliveryEnabled: true,
-  distancePricingEnabled: false,
   distanceRulesEnabled: false,
   maxDeliveryKm: null as number | null,
   baseFee: 0,
+  freeDeliveryEnabled: false,
+  freeDeliveryThreshold: null as number | null,
+  thresholdForNonSubscribers: true,
+  roadDistanceMultiplier: 1,
+
+  // ── DEAD (kept only for create-fallback; never updatable) ────────
+  distancePricingEnabled: false,
   feePerKm: 0,
   minimumFee: 0,
   maximumFee: 999,
-  freeDeliveryEnabled: false,
-  freeDeliveryThreshold: null as number | null,
   thresholdForSubscribers: true,
-  thresholdForNonSubscribers: true,
 };
 
-export async function updateDeliverySettings(data: Partial<typeof SETTINGS_DEFAULTS>) {
+/**
+ * Whitelisted update shape — matches the Zod schema in
+ * `delivery.controller.ts`. Callers other than the controller (currently
+ * none) must conform to this shape too.
+ */
+export interface UpdateDeliverySettingsInput {
+  deliveryEnabled?: boolean;
+  maxDeliveryKm?: number | null;
+  distanceRulesEnabled?: boolean;
+  roadDistanceMultiplier?: number;
+  baseFee?: number;
+  freeDeliveryEnabled?: boolean;
+  freeDeliveryThreshold?: number | null;
+  thresholdForNonSubscribers?: boolean;
+}
+
+export async function updateDeliverySettings(data: UpdateDeliverySettingsInput) {
   const existing = await prisma.deliveryPricingSettings.findFirst();
   if (existing) {
     return prisma.deliveryPricingSettings.update({

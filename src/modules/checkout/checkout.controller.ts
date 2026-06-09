@@ -2,8 +2,7 @@ import { Response } from 'express';
 import { z } from 'zod';
 import { AuthRequest } from '../../middleware/auth.middleware';
 import { ok, badRequest } from '../../lib/response';
-import { quoteDelivery } from '../delivery/delivery.service';
-import { prisma } from '../../lib/prisma';
+import { quoteDelivery, loadSubscriptionContext } from '../delivery/delivery.service';
 
 const calculateSchema = z.object({
   customerLatitude: z.number().min(-90).max(90).nullable().optional(),
@@ -29,57 +28,34 @@ export async function calculateDelivery(req: AuthRequest, res: Response): Promis
   try {
     const body = calculateSchema.parse(req.body);
 
-    // Resolve the real subscription status server-side. If the authenticated
-    // user has an ACTIVE subscription, use that — we ignore the client claim.
-    let hasActiveSubscription = false;
-    let subscriptionBenefitType: string | null = null;
-    let subscriptionDiscountValue: number | null = null;
-    let subscriptionCappedFee: number | null = null;
-
-    if (req.user) {
-      const sub = await prisma.customerSubscription.findFirst({
-        where: {
-          customerId: req.user.userId,
-          status: 'ACTIVE',
-          expiryDate: { gt: new Date() },
-        },
-        include: { plan: true },
-      });
-      if (sub) {
-        hasActiveSubscription = true;
-        subscriptionBenefitType = sub.plan.benefitType;
-        subscriptionDiscountValue = sub.plan.discountValue ? Number(sub.plan.discountValue) : null;
-        subscriptionCappedFee = sub.plan.cappedFee ? Number(sub.plan.cappedFee) : null;
-      }
-    } else if (body.customerSubscriptionStatus === 'ACTIVE') {
-      // Anonymous claim of ACTIVE subscription — we honour the flag but can't
-      // load benefits, so treat as FREE_DELIVERY at most. In practice the
-      // frontend only sends 'NONE' for anonymous users.
-      hasActiveSubscription = true;
+    // Phase 3: subscription context resolution moved to the shared
+    // helper so cart, checkout, and order creation all decide identically.
+    // Authenticated users get the real subscription. Anonymous users that
+    // claim ACTIVE are honoured but get no benefit params, which means
+    // the calc treats them as FREE_DELIVERY (fee 0) at most — the same
+    // pre-Phase-3 behavior.
+    let subContext = await loadSubscriptionContext(req.user?.userId);
+    if (!req.user && body.customerSubscriptionStatus === 'ACTIVE') {
+      subContext = { ...subContext, hasActiveSubscription: true };
     }
 
+    // PICKUP→fee 0 is now applied inside `quoteDelivery` itself, so
+    // there's no separate "effective fee" calculation here.
+    const selected = body.selectedFulfillmentType ?? null;
     const quote = await quoteDelivery({
       customerLat: body.customerLatitude ?? undefined,
       customerLng: body.customerLongitude ?? undefined,
       cartSubtotal: body.cartSubtotal ?? undefined,
-      hasActiveSubscription,
-      subscriptionBenefitType,
-      subscriptionDiscountValue,
-      subscriptionCappedFee,
+      fulfillmentType: selected ?? undefined,
+      ...subContext,
     });
-
-    // Honour the customer's selected fulfillment by reporting the right fee:
-    // a pickup checkout always pays 0 for delivery, even when delivery would
-    // otherwise be available.
-    const selected = body.selectedFulfillmentType ?? null;
-    const effectiveFee = selected === 'PICKUP' ? 0 : quote.fee;
 
     ok(res, {
       distanceKm: quote.distanceKm,
       isWithinDeliveryRange: quote.withinRange,
       deliveryAvailable: quote.deliveryAvailable,
       pickupAvailable: quote.pickupAvailable,
-      deliveryFee: effectiveFee,
+      deliveryFee: quote.fee,
       matchedDistanceRule: quote.matchedRule,
       availableFulfillmentTypes: quote.availableFulfillmentTypes,
       selectedFulfillmentType: selected,

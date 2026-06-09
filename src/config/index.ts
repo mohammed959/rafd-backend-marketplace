@@ -35,6 +35,15 @@ export const config = {
     defaultCategoryImageUrl:
       process.env.DEFAULT_CATEGORY_IMAGE_URL ??
       'https://your-zone.b-cdn.net/category/default/default.png',
+
+    // Brands: ${brandBaseUrl}/{english-slug}.${brandExtension}
+    brandBaseUrl: stripTrailingSlash(
+      process.env.BUNNY_BRAND_BASE_URL ?? 'https://your-zone.b-cdn.net/brand'
+    ),
+    brandExtension: (process.env.BUNNY_BRAND_IMAGE_EXT ?? 'png').replace(/^\./, ''),
+    defaultBrandImageUrl:
+      process.env.DEFAULT_BRAND_IMAGE_URL ??
+      'https://your-zone.b-cdn.net/brand/default/default.png',
   },
   isDev: (process.env.NODE_ENV ?? 'development') === 'development',
 };

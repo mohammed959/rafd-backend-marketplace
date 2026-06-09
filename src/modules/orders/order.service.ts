@@ -9,7 +9,7 @@ import {
   notifyPaymentRejected,
 } from '../notifications/notification.service';
 import { evaluatePromotionsForCart } from '../promotions/promotion.service';
-import { quoteDelivery } from '../delivery/delivery.service';
+import { quoteDelivery, loadSubscriptionContext } from '../delivery/delivery.service';
 import { logAction } from '../audit/audit.service';
 import { getProductImageUrl } from '../../lib/productImage';
 import { assertSlotIsBookable } from '../pickup/pickup.service';
@@ -97,57 +97,72 @@ export async function createOrder(customerId: string, input: CreateOrderInput) {
     }
   }
 
-  // Load variants and validate stock
-  const variantIds = input.items.map((i) => i.variantId);
-  const variants = await prisma.productVariant.findMany({
-    where: { id: { in: variantIds }, isActive: true },
-    include: {
-      product: { select: { id: true, categoryId: true, subcategoryId: true } },
+  // Phase 6: orders are product-keyed. Load products, validate stock,
+  // snapshot SKU/barcode/names onto the order item so the row remains
+  // readable even if the product is later renamed or deleted.
+  const productIds = input.items.map((i) => i.productId);
+  const products = await prisma.product.findMany({
+    where: { id: { in: productIds }, isActive: true },
+    select: {
+      id: true, name: true, nameAr: true,
+      sku: true, barcode: true, price: true,
+      stock: true, reserved: true,
+      categoryId: true, subcategoryId: true,
     },
   });
 
-  if (variants.length !== variantIds.length) {
+  if (products.length !== productIds.length) {
     throw new Error('One or more products are unavailable');
   }
 
-  // Build item data with prices
-  const itemMap = new Map(input.items.map((i) => [i.variantId, i.quantity]));
+  const qtyByProduct = new Map(input.items.map((i) => [i.productId, i.quantity]));
   let subtotal = 0;
   const orderItems: Prisma.OrderItemCreateManyOrderInput[] = [];
   const evaluatorItems = [];
 
-  for (const variant of variants) {
-    const qty = itemMap.get(variant.id)!;
-    const available = variant.stock - variant.reserved;
+  for (const product of products) {
+    const qty = qtyByProduct.get(product.id)!;
+    const available = product.stock - product.reserved;
     if (available < qty) {
-      throw new Error(`Insufficient stock for variant ${variant.sku}`);
+      throw new Error(`Insufficient stock for product ${product.sku ?? product.name}`);
     }
-    const lineTotal = Number(variant.price) * qty;
+    if (product.price == null) {
+      throw new Error(`Product ${product.sku ?? product.name} has no price set`);
+    }
+    const unitPrice = Number(product.price);
+    const lineTotal = unitPrice * qty;
     subtotal += lineTotal;
     orderItems.push({
-      variantId: variant.id,
+      productId: product.id,
+      productSku: product.sku,
+      productBarcode: product.barcode,
+      productName: product.name,
+      productNameAr: product.nameAr,
       quantity: qty,
-      unitPrice: variant.price,
+      unitPrice: product.price,
       total: lineTotal,
     });
     evaluatorItems.push({
-      variantId: variant.id,
+      // Variant-targeted promotions cannot match flat products — pass
+      // empty so VARIANT_DISCOUNT/BUY_X_GET_Y never trigger on this line
+      // while product / category / subcategory targets still work.
+      variantId: '',
       quantity: qty,
-      unitPrice: Number(variant.price),
-      productId: variant.product.id,
-      categoryId: variant.product.categoryId,
-      subcategoryId: variant.product.subcategoryId,
+      unitPrice,
+      productId: product.id,
+      categoryId: product.categoryId,
+      subcategoryId: product.subcategoryId,
     });
   }
 
-  // Load delivery & minimum order settings
-  const [_deliverySettings, minimumSettings, activeSubscription] = await Promise.all([
+  // Phase 3: subscription context now flows through the shared
+  // `loadSubscriptionContext` helper so the cart, checkout, and order
+  // creation all decide identically. The minimum-order setting is
+  // orthogonal to delivery pricing.
+  const [_deliverySettings, minimumSettings, subscriptionContext] = await Promise.all([
     prisma.deliveryPricingSettings.findFirst(),
     prisma.minimumOrderSettings.findFirst(),
-    prisma.customerSubscription.findFirst({
-      where: { customerId, status: 'ACTIVE', expiryDate: { gt: new Date() } },
-      include: { plan: true },
-    }),
+    loadSubscriptionContext(customerId),
   ]);
 
   if (minimumSettings?.enabled && subtotal < Number(minimumSettings.minimumAmount)) {
@@ -160,24 +175,20 @@ export async function createOrder(customerId: string, input: CreateOrderInput) {
   const promoResults = await evaluatePromotionsForCart({
     customerId,
     items: evaluatorItems,
-    hasActiveSubscription: Boolean(activeSubscription),
+    hasActiveSubscription: subscriptionContext.hasActiveSubscription,
   });
 
   const discountTotal = promoResults.reduce((sum, r) => sum + r.discountAmount, 0);
 
-  // Compute distance + delivery eligibility. For pickup, distance is informational only.
+  // Phase 3: fee is computed in exactly one place. `fulfillmentType` is
+  // passed so `quoteDelivery` itself returns 0 for pickup — order
+  // creation no longer needs a local `isPickup ? 0 : quote.fee` branch.
   const quote = await quoteDelivery({
     customerLat: resolvedLat,
     customerLng: resolvedLng,
     cartSubtotal: subtotal,
-    hasActiveSubscription: Boolean(activeSubscription),
-    subscriptionBenefitType: activeSubscription?.plan.benefitType ?? null,
-    subscriptionDiscountValue: activeSubscription?.plan.discountValue
-      ? Number(activeSubscription.plan.discountValue)
-      : null,
-    subscriptionCappedFee: activeSubscription?.plan.cappedFee
-      ? Number(activeSubscription.plan.cappedFee)
-      : null,
+    fulfillmentType,
+    ...subscriptionContext,
   });
 
   if (!isPickup) {
@@ -197,8 +208,7 @@ export async function createOrder(customerId: string, input: CreateOrderInput) {
     }
   }
 
-  // Pickup orders skip delivery — no fee is charged, regardless of settings.
-  const deliveryFee = isPickup ? 0 : quote.fee;
+  const deliveryFee = quote.fee;
   const total = Math.max(0, subtotal - discountTotal + deliveryFee);
 
   const order = await prisma.$transaction(async (tx) => {
@@ -216,8 +226,7 @@ export async function createOrder(customerId: string, input: CreateOrderInput) {
         deliveryLat: isPickup ? undefined : resolvedLat,
         deliveryLng: isPickup ? undefined : resolvedLng,
         distanceKm: isPickup ? undefined : quote.distanceKm ?? undefined,
-        subscriptionApplied:
-          !isPickup && Boolean(activeSubscription) && quote.pricingRuleApplied === 'SUBSCRIPTION',
+        subscriptionApplied: quote.pricingRuleApplied === 'SUBSCRIPTION',
         pickupType: scheduledFields.pickupType,
         scheduledPickupDate: scheduledFields.scheduledPickupDate,
         scheduledPickupStartTime: scheduledFields.scheduledPickupStartTime,
@@ -235,12 +244,21 @@ export async function createOrder(customerId: string, input: CreateOrderInput) {
       include: { items: true, statusHistory: true },
     });
 
-    // Reserve stock for paid items
+    // Reserve stock for paid items (product-keyed; legacy variant rows
+    // are reserved via the variant fallback for back-compat with
+    // promotion free items that still reference variantId).
     for (const item of orderItems) {
-      await tx.productVariant.update({
-        where: { id: item.variantId },
-        data: { reserved: { increment: item.quantity } },
-      });
+      if (item.productId) {
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { reserved: { increment: item.quantity } },
+        });
+      } else if (item.variantId) {
+        await tx.productVariant.update({
+          where: { id: item.variantId },
+          data: { reserved: { increment: item.quantity } },
+        });
+      }
     }
 
     // Persist promotion usages + add free items
@@ -492,8 +510,38 @@ export async function attachPaymentProof(customerId: string, orderId: string, pr
   return updated;
 }
 
+/**
+ * Decorate an order item so every consumer sees both shapes:
+ *   • `item.product` — the new flat path (Phase 6+)
+ *   • `item.variant` — synthesized from product fields if absent, so
+ *     legacy admin/picker/driver UI that reads `item.variant.product`
+ *     keeps rendering for new orders without code changes.
+ */
+function decorateOrderItem<T extends Record<string, unknown>>(item: T): T {
+  const realVariant = (item as any).variant ?? null;
+  const realProduct = (item as any).product ?? null;
+  const productSummary = realProduct ?? realVariant?.product ?? null;
+  const variantSummary =
+    realVariant ??
+    ((item as any).productId
+      ? {
+          id: (item as any).productId,
+          type: 'PIECE',
+          sku: (item as any).productSku ?? productSummary?.sku ?? '',
+          price: (item as any).unitPrice,
+          product: productSummary,
+        }
+      : null);
+  return { ...item, product: productSummary, variant: variantSummary } as T;
+}
+
+function decorateOrder<T extends { items: any[] } | null>(order: T): T {
+  if (!order) return order;
+  return { ...order, items: order.items.map(decorateOrderItem) } as T;
+}
+
 export async function getOrderById(id: string) {
-  return prisma.order.findUnique({
+  const order = await prisma.order.findUnique({
     where: { id },
     include: {
       customer: { select: { id: true, name: true, mobile: true } },
@@ -504,14 +552,16 @@ export async function getOrderById(id: string) {
       items: {
         include: {
           variant: {
-            include: { product: { select: { id: true, name: true, nameAr: true, imageUrl: true } } },
+            include: { product: { select: { id: true, name: true, nameAr: true, imageUrl: true, sku: true, barcode: true } } },
           },
+          product: { select: { id: true, name: true, nameAr: true, imageUrl: true, sku: true, barcode: true } },
         },
       },
       orderPromotions: true,
       statusHistory: { orderBy: { createdAt: 'asc' } },
     },
   });
+  return decorateOrder(order);
 }
 
 export async function listOrders(opts: {
@@ -687,14 +737,22 @@ export async function updateOrderStatus(
       },
     });
 
-    // Release reserved stock on cancel/reject
+    // Release reserved stock on cancel/reject. Handles both Phase 6
+    // product-keyed items and legacy variant-keyed items.
     if (status === 'CANCELLED' || status === 'REJECTED') {
       const items = await tx.orderItem.findMany({ where: { orderId } });
       for (const item of items) {
-        await tx.productVariant.update({
-          where: { id: item.variantId },
-          data: { reserved: { decrement: item.quantity } },
-        });
+        if (item.productId) {
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { reserved: { decrement: item.quantity } },
+          });
+        } else if (item.variantId) {
+          await tx.productVariant.update({
+            where: { id: item.variantId },
+            data: { reserved: { decrement: item.quantity } },
+          });
+        }
       }
     }
 
@@ -702,13 +760,23 @@ export async function updateOrderStatus(
     if (status === 'CONFIRMED' || status === 'PICKED_UP_BY_CUSTOMER') {
       const items = await tx.orderItem.findMany({ where: { orderId } });
       for (const item of items) {
-        await tx.productVariant.update({
-          where: { id: item.variantId },
-          data: {
-            stock: { decrement: item.quantity },
-            reserved: { decrement: item.quantity },
-          },
-        });
+        if (item.productId) {
+          await tx.product.update({
+            where: { id: item.productId },
+            data: {
+              stock: { decrement: item.quantity },
+              reserved: { decrement: item.quantity },
+            },
+          });
+        } else if (item.variantId) {
+          await tx.productVariant.update({
+            where: { id: item.variantId },
+            data: {
+              stock: { decrement: item.quantity },
+              reserved: { decrement: item.quantity },
+            },
+          });
+        }
       }
     }
 
@@ -829,19 +897,26 @@ export async function setOrderItemStatus(
     if (!item) throw new Error('Order item not found');
     if (item.status === 'REPLACED') throw new Error('Item already replaced');
 
-    // Release reservation if going inactive from active
+    // Release reservation if going inactive from active. Picker workflow
+    // still runs through this path for legacy variant rows; new flat
+    // orders adjust the product-level reservation instead.
     const wasActive = item.status === 'PENDING' || item.status === 'PICKED';
     const willBeActive = status === 'PICKED';
-    if (wasActive && !willBeActive) {
-      await tx.productVariant.update({
-        where: { id: item.variantId },
-        data: { reserved: { decrement: item.quantity } },
-      });
-    } else if (!wasActive && willBeActive) {
-      await tx.productVariant.update({
-        where: { id: item.variantId },
-        data: { reserved: { increment: item.quantity } },
-      });
+    const reservationDelta = wasActive && !willBeActive ? -item.quantity
+      : !wasActive && willBeActive ? item.quantity
+      : 0;
+    if (reservationDelta !== 0) {
+      if (item.productId) {
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { reserved: { increment: reservationDelta } },
+        });
+      } else if (item.variantId) {
+        await tx.productVariant.update({
+          where: { id: item.variantId },
+          data: { reserved: { increment: reservationDelta } },
+        });
+      }
     }
 
     const updated = await tx.orderItem.update({
@@ -861,10 +936,18 @@ export async function setOrderItemStatus(
   });
 }
 
+/**
+ * Phase 7 replacement: picker substitutes one flat product for another.
+ * The original line is marked REPLACED (its reservation released — at
+ * the product or variant level depending on which side of the migration
+ * it came from). A new OrderItem is created against the replacement
+ * product, with SKU/barcode/name snapshot fields so it renders the same
+ * way as any other Phase 6 order line.
+ */
 export async function replaceOrderItem(
   orderId: string,
   itemId: string,
-  newVariantId: string,
+  newProductId: string,
   quantity: number | undefined,
   actor: { userId: string; role: string }
 ) {
@@ -876,36 +959,57 @@ export async function replaceOrderItem(
       throw new Error('Item cannot be replaced (already handled)');
     }
 
-    const newVariant = await tx.productVariant.findFirst({
-      where: { id: newVariantId, isActive: true, product: { isActive: true } },
+    const newProduct = await tx.product.findFirst({
+      where: { id: newProductId, isActive: true },
+      select: {
+        id: true, name: true, nameAr: true,
+        sku: true, barcode: true,
+        price: true, stock: true, reserved: true,
+      },
     });
-    if (!newVariant) throw new Error('Replacement variant not available');
-
-    const qty = quantity && quantity > 0 ? quantity : original.quantity;
-    const available = newVariant.stock - newVariant.reserved;
-    if (available < qty) throw new Error(`Only ${available} of replacement variant available`);
-
-    const unitPrice = newVariant.price;
-    const total = Number(unitPrice) * qty;
-
-    // Release reservation on the original variant
-    if (original.status === 'PENDING' || original.status === 'PICKED') {
-      await tx.productVariant.update({
-        where: { id: original.variantId },
-        data: { reserved: { decrement: original.quantity } },
-      });
+    if (!newProduct) throw new Error('Replacement product is not available');
+    if (newProduct.price == null) {
+      throw new Error('Replacement product has no price set');
     }
 
-    // Reserve on the replacement variant
-    await tx.productVariant.update({
-      where: { id: newVariant.id },
+    const qty = quantity && quantity > 0 ? quantity : original.quantity;
+    const available = newProduct.stock - newProduct.reserved;
+    if (available < qty) throw new Error(`Only ${available} of replacement product available`);
+
+    const unitPrice = newProduct.price;
+    const total = Number(unitPrice) * qty;
+
+    // Release the original line's reservation on whichever inventory it
+    // was holding (product-level for Phase 6+ orders, variant-level for
+    // historical orders placed before the migration).
+    if (original.status === 'PENDING' || original.status === 'PICKED') {
+      if (original.productId) {
+        await tx.product.update({
+          where: { id: original.productId },
+          data: { reserved: { decrement: original.quantity } },
+        });
+      } else if (original.variantId) {
+        await tx.productVariant.update({
+          where: { id: original.variantId },
+          data: { reserved: { decrement: original.quantity } },
+        });
+      }
+    }
+
+    // Reserve on the replacement product.
+    await tx.product.update({
+      where: { id: newProduct.id },
       data: { reserved: { increment: qty } },
     });
 
     const replacement = await tx.orderItem.create({
       data: {
         orderId,
-        variantId: newVariant.id,
+        productId: newProduct.id,
+        productSku: newProduct.sku,
+        productBarcode: newProduct.barcode,
+        productName: newProduct.name,
+        productNameAr: newProduct.nameAr,
         quantity: qty,
         unitPrice,
         total,
@@ -925,73 +1029,128 @@ export async function replaceOrderItem(
       actorId: actor.userId, actorRole: actor.role,
       action: 'order.item.replace',
       entityType: 'order_item', entityId: original.id,
-      changes: { orderId, replacedWithVariantId: newVariant.id, qty },
+      changes: { orderId, replacedWithProductId: newProduct.id, qty },
     }, tx);
 
     return { replacement, replaced: original.id };
   });
 }
 
+/**
+ * Phase 6 buy-again: aggregate the customer's purchase history at the
+ * product level. New flat orders contribute via `productId`; legacy
+ * variant rows are resolved through their parent product so a single
+ * customer's history covers both schemas. Returns at most `limit`
+ * in-stock active products, ordered by order count then most-recent
+ * purchase. `suggestedVariantId` is gone — the customer cart is now
+ * product-keyed.
+ */
 export async function getBuyAgainProducts(customerId: string, limit = 20) {
-  // Aggregate variants this customer has ordered
-  const variantUsage = await prisma.orderItem.groupBy({
+  const usageByProduct = new Map<string, { count: number; lastUsed: Date | null }>();
+
+  // 1) Flat product rows
+  const flatUsage = await prisma.orderItem.groupBy({
+    by: ['productId'],
+    where: { order: { customerId }, productId: { not: null } },
+    _count: { productId: true },
+    _max: { createdAt: true },
+    orderBy: [{ _count: { productId: 'desc' } }, { _max: { createdAt: 'desc' } }],
+    take: limit * 3,
+  });
+  for (const row of flatUsage) {
+    if (!row.productId) continue;
+    usageByProduct.set(row.productId, {
+      count: row._count.productId,
+      lastUsed: row._max.createdAt,
+    });
+  }
+
+  // 2) Legacy variant rows — resolve to their product so they merge with
+  // the flat counts above for customers that span the migration.
+  const legacyUsage = await prisma.orderItem.groupBy({
     by: ['variantId'],
-    where: { order: { customerId } },
-    _sum: { quantity: true },
+    where: { order: { customerId }, productId: null, variantId: { not: null } },
     _count: { variantId: true },
     _max: { createdAt: true },
     orderBy: [{ _count: { variantId: 'desc' } }, { _max: { createdAt: 'desc' } }],
-    take: limit * 3, // overfetch to allow filtering
+    take: limit * 3,
   });
-
-  if (variantUsage.length === 0) return [];
-
-  const variantIds = variantUsage.map((v) => v.variantId);
-  const variants = await prisma.productVariant.findMany({
-    where: { id: { in: variantIds }, isActive: true },
-    include: {
-      product: {
-        include: {
-          category: { select: { id: true, name: true, nameAr: true } },
-          subcategory: { select: { id: true, name: true, nameAr: true } },
-          variants: { where: { isActive: true }, orderBy: { price: 'asc' } },
-        },
-      },
-    },
-  });
-
-  // Group by product so we don't repeat the same product per variant
-  const byProduct = new Map<string, { product: typeof variants[number]['product']; bestVariantId: string; orderCount: number }>();
-  for (const usage of variantUsage) {
-    const variant = variants.find((v) => v.id === usage.variantId);
-    if (!variant || !variant.product.isActive) continue;
-    if (variant.stock - variant.reserved <= 0) continue;
-    const existing = byProduct.get(variant.product.id);
-    if (!existing) {
-      byProduct.set(variant.product.id, {
-        product: variant.product,
-        bestVariantId: variant.id,
-        orderCount: usage._count.variantId,
-      });
+  if (legacyUsage.length > 0) {
+    const legacyVariantIds = legacyUsage.map((r) => r.variantId).filter((id): id is string => !!id);
+    const legacyVariants = await prisma.productVariant.findMany({
+      where: { id: { in: legacyVariantIds } },
+      select: { id: true, productId: true },
+    });
+    const legacyProductByVariant = new Map(legacyVariants.map((v) => [v.id, v.productId]));
+    for (const row of legacyUsage) {
+      const pid = row.variantId ? legacyProductByVariant.get(row.variantId) : undefined;
+      if (!pid) continue;
+      const existing = usageByProduct.get(pid);
+      const next = {
+        count: (existing?.count ?? 0) + row._count.variantId,
+        lastUsed: !existing?.lastUsed || (row._max.createdAt && row._max.createdAt > existing.lastUsed)
+          ? row._max.createdAt
+          : existing.lastUsed,
+      };
+      usageByProduct.set(pid, next);
     }
   }
 
-  return Array.from(byProduct.values()).slice(0, limit).map((entry) => ({
-    product: entry.product,
-    suggestedVariantId: entry.bestVariantId,
-    orderCount: entry.orderCount,
-  }));
+  if (usageByProduct.size === 0) return [];
+
+  const products = await prisma.product.findMany({
+    where: { id: { in: Array.from(usageByProduct.keys()) }, isActive: true },
+    include: {
+      category: { select: { id: true, name: true, nameAr: true } },
+      subcategory: { select: { id: true, name: true, nameAr: true } },
+      brand: { select: { id: true, name: true, nameAr: true, slug: true } },
+    },
+  });
+
+  const inStock = products.filter((p) => (p.stock ?? 0) - (p.reserved ?? 0) > 0);
+  const entries = inStock
+    .map((product) => {
+      const u = usageByProduct.get(product.id)!;
+      return { product, orderCount: u.count, lastUsed: u.lastUsed };
+    })
+    .sort((a, b) => {
+      if (b.orderCount !== a.orderCount) return b.orderCount - a.orderCount;
+      const al = a.lastUsed ? a.lastUsed.getTime() : 0;
+      const bl = b.lastUsed ? b.lastUsed.getTime() : 0;
+      return bl - al;
+    })
+    .slice(0, limit)
+    .map(({ product, orderCount }) => ({ product, orderCount }));
+
+  return entries;
 }
 
+/**
+ * Phase 6 reorder: returns product-keyed cart items. Resolves each order
+ * line back to its current product — for flat orders via `productId`,
+ * for legacy variant rows via `variant.product`. The cart is product-keyed
+ * end-to-end so the response no longer carries `variantId`/`variantType`.
+ */
 export async function buildReorderCart(customerId: string, orderId: string) {
   const order = await prisma.order.findFirst({
     where: { id: orderId, customerId },
     include: {
       items: {
         include: {
+          product: {
+            select: {
+              id: true, name: true, nameAr: true, sku: true,
+              price: true, stock: true, reserved: true, isActive: true,
+            },
+          },
           variant: {
             include: {
-              product: { select: { id: true, name: true, nameAr: true, imageUrl: true, isActive: true } },
+              product: {
+                select: {
+                  id: true, name: true, nameAr: true, sku: true,
+                  price: true, stock: true, reserved: true, isActive: true,
+                },
+              },
             },
           },
         },
@@ -1001,11 +1160,9 @@ export async function buildReorderCart(customerId: string, orderId: string) {
   if (!order) throw new Error('Order not found');
 
   const items: Array<{
-    variantId: string;
     productId: string;
     productName: string;
     productImage: string | null;
-    variantType: string;
     price: number;
     quantity: number;
     priceChanged: boolean;
@@ -1014,36 +1171,36 @@ export async function buildReorderCart(customerId: string, orderId: string) {
 
   const skipped: Array<{
     productName: string;
-    variantType: string;
     quantity: number;
     reason: string;
   }> = [];
 
   for (const item of order.items) {
-    const v = item.variant;
-    const product = v.product;
-    const available = v.isActive && product.isActive && v.stock - v.reserved >= item.quantity;
-    if (!available) {
-      skipped.push({
-        productName: product.name,
-        variantType: v.type,
-        quantity: item.quantity,
-        reason: !product.isActive
-          ? 'Product no longer available'
-          : !v.isActive
-            ? 'Variant no longer available'
-            : 'Out of stock',
-      });
+    const product = item.product ?? item.variant?.product ?? null;
+    const displayName = item.productName ?? product?.name ?? 'Unknown product';
+    if (!product) {
+      skipped.push({ productName: displayName, quantity: item.quantity, reason: 'Product no longer available' });
       continue;
     }
-    const currentPrice = Number(v.price);
+    if (!product.isActive) {
+      skipped.push({ productName: product.name, quantity: item.quantity, reason: 'Product no longer available' });
+      continue;
+    }
+    const available = (product.stock ?? 0) - (product.reserved ?? 0);
+    if (available < item.quantity) {
+      skipped.push({ productName: product.name, quantity: item.quantity, reason: 'Out of stock' });
+      continue;
+    }
+    if (product.price == null) {
+      skipped.push({ productName: product.name, quantity: item.quantity, reason: 'Product price not set' });
+      continue;
+    }
+    const currentPrice = Number(product.price);
     const originalPrice = Number(item.unitPrice);
     items.push({
-      variantId: v.id,
       productId: product.id,
       productName: product.name,
-      productImage: getProductImageUrl(v.sku),
-      variantType: v.type,
+      productImage: getProductImageUrl(product.sku ?? item.productSku),
       price: currentPrice,
       quantity: item.quantity,
       priceChanged: currentPrice !== originalPrice,
@@ -1084,8 +1241,8 @@ export async function getDashboardStats() {
     prisma.order.count({ where: { status: 'CANCELLED', createdAt: { gte: today } } }),
     prisma.order.count({ where: { status: 'DELIVERED', deliveredAt: { gte: today } } }),
     prisma.order.count({ where: { paymentMethod: 'BANK_TRANSFER', paymentStatus: 'UNDER_REVIEW' } }),
-    prisma.productVariant.count({
-      where: { isActive: true, stock: { lte: LOW_STOCK_THRESHOLD }, product: { isActive: true } },
+    prisma.product.count({
+      where: { isActive: true, stock: { lte: LOW_STOCK_THRESHOLD } },
     }),
     prisma.user.count({ where: { role: 'DRIVER', isActive: true } }),
     prisma.user.count({ where: { role: 'PICKER', isActive: true } }),
@@ -1118,25 +1275,63 @@ export async function getDashboardStats() {
     prisma.order.count({ where: { fulfillmentType: 'PICKUP', status: 'READY_FOR_PICKUP' } }),
   ]);
 
-  const mostOrderedRaw = await prisma.orderItem.groupBy({
-    by: ['variantId'],
-    _sum: { quantity: true },
-    orderBy: { _sum: { quantity: 'desc' } },
-    take: 5,
-  });
-
-  const mostOrderedVariants = await prisma.productVariant.findMany({
-    where: { id: { in: mostOrderedRaw.map((r) => r.variantId) } },
-    include: { product: { select: { id: true, name: true, nameAr: true, imageUrl: true } } },
-  });
-
-  const mostOrdered = mostOrderedRaw.map((r) => {
-    const v = mostOrderedVariants.find((x) => x.id === r.variantId);
+  // Most ordered — now grouped by productId. Legacy variant rows are
+  // resolved through their parent product, then merged with the flat
+  // counts so the dashboard stays accurate across the schema migration.
+  const [flatTop, legacyTop] = await Promise.all([
+    prisma.orderItem.groupBy({
+      by: ['productId'],
+      where: { productId: { not: null } },
+      _sum: { quantity: true },
+      orderBy: { _sum: { quantity: 'desc' } },
+      take: 50,
+    }),
+    prisma.orderItem.groupBy({
+      by: ['variantId'],
+      where: { productId: null, variantId: { not: null } },
+      _sum: { quantity: true },
+      orderBy: { _sum: { quantity: 'desc' } },
+      take: 50,
+    }),
+  ]);
+  const totalByProduct = new Map<string, number>();
+  for (const r of flatTop) {
+    if (!r.productId) continue;
+    totalByProduct.set(r.productId, (totalByProduct.get(r.productId) ?? 0) + (r._sum.quantity ?? 0));
+  }
+  if (legacyTop.length > 0) {
+    const legacyVariantIds = legacyTop.map((r) => r.variantId).filter((id): id is string => !!id);
+    const legacyVariants = await prisma.productVariant.findMany({
+      where: { id: { in: legacyVariantIds } },
+      select: { id: true, productId: true },
+    });
+    const legacyProductByVariant = new Map(legacyVariants.map((v) => [v.id, v.productId]));
+    for (const r of legacyTop) {
+      const pid = r.variantId ? legacyProductByVariant.get(r.variantId) : undefined;
+      if (!pid) continue;
+      totalByProduct.set(pid, (totalByProduct.get(pid) ?? 0) + (r._sum.quantity ?? 0));
+    }
+  }
+  const topPids = Array.from(totalByProduct.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([pid]) => pid);
+  const topProductRows = topPids.length
+    ? await prisma.product.findMany({
+        where: { id: { in: topPids } },
+        select: { id: true, name: true, nameAr: true, imageUrl: true, sku: true },
+      })
+    : [];
+  const mostOrdered = topPids.map((pid) => {
+    const product = topProductRows.find((p) => p.id === pid) ?? null;
     return {
-      variantId: r.variantId,
-      quantitySold: r._sum.quantity ?? 0,
-      variantType: v?.type ?? null,
-      product: v?.product ?? null,
+      productId: pid,
+      // Legacy field kept (null) so existing admin dashboard widgets
+      // that destructure `variantId`/`variantType` don't crash.
+      variantId: null,
+      variantType: null,
+      quantitySold: totalByProduct.get(pid) ?? 0,
+      product,
     };
   });
 

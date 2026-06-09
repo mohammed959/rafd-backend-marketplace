@@ -4,53 +4,45 @@ import { AuthRequest } from '../../middleware/auth.middleware';
 import * as svc from './delivery.service';
 import { ok, badRequest } from '../../lib/response';
 
-async function loadSubscriptionContext(userId?: string) {
-  if (!userId) return {};
-  const { prisma } = await import('../../lib/prisma');
-  const sub = await prisma.customerSubscription.findFirst({
-    where: {
-      customerId: userId,
-      status: 'ACTIVE',
-      expiryDate: { gt: new Date() },
-    },
-    include: { plan: true },
-  });
-  if (!sub) return {};
-  return {
-    hasActiveSubscription: true,
-    subscriptionBenefitType: sub.plan.benefitType,
-    subscriptionDiscountValue: sub.plan.discountValue ? Number(sub.plan.discountValue) : null,
-    subscriptionCappedFee: sub.plan.cappedFee ? Number(sub.plan.cappedFee) : null,
-  };
-}
-
+/**
+ * Phase 3: both `calculateFee` and `quote` delegate to the same
+ * `svc.quoteDelivery` after loading subscription context through the
+ * shared `svc.loadSubscriptionContext` helper. `fulfillmentType` is
+ * optional — when the cart layer doesn't supply it the response is the
+ * delivery fee (existing behavior); when PICKUP is supplied the calc
+ * returns fee = 0.
+ */
 export async function calculateFee(req: AuthRequest, res: Response): Promise<void> {
-  const { customerLat, customerLng, cartSubtotal } = req.body as {
+  const { customerLat, customerLng, cartSubtotal, fulfillmentType } = req.body as {
     customerLat?: number;
     customerLng?: number;
     cartSubtotal: number;
+    fulfillmentType?: 'DELIVERY' | 'PICKUP';
   };
-  const sub = await loadSubscriptionContext(req.user?.userId);
+  const sub = await svc.loadSubscriptionContext(req.user?.userId);
   const result = await svc.quoteDelivery({
     customerLat,
     customerLng,
     cartSubtotal,
+    fulfillmentType,
     ...sub,
   });
   ok(res, result);
 }
 
 export async function quote(req: AuthRequest, res: Response): Promise<void> {
-  const { customerLat, customerLng, cartSubtotal } = req.body as {
+  const { customerLat, customerLng, cartSubtotal, fulfillmentType } = req.body as {
     customerLat?: number;
     customerLng?: number;
     cartSubtotal?: number;
+    fulfillmentType?: 'DELIVERY' | 'PICKUP';
   };
-  const sub = await loadSubscriptionContext(req.user?.userId);
+  const sub = await svc.loadSubscriptionContext(req.user?.userId);
   const result = await svc.quoteDelivery({
     customerLat,
     customerLng,
     cartSubtotal,
+    fulfillmentType,
     ...sub,
   });
   ok(res, result);
@@ -85,9 +77,34 @@ export async function getSettings(_req: AuthRequest, res: Response): Promise<voi
   ok(res, data);
 }
 
+/**
+ * Single contract for `PUT /api/delivery/settings`. Whitelists only the
+ * fields that `quoteDelivery` actually reads. Anything else (legacy
+ * `distancePricingEnabled`, `feePerKm`, `minimumFee`, `maximumFee`,
+ * `thresholdForSubscribers`) is stripped by Zod's default `.strip()`
+ * behavior — the legacy `/admin/settings` page keeps working but its
+ * writes to dead fields become no-ops, so `/admin/branch-coverage`
+ * remains the single source of truth for delivery configuration.
+ */
+const updateSettingsSchema = z.object({
+  // Coverage gates
+  deliveryEnabled: z.boolean().optional(),
+  maxDeliveryKm: z.number().positive().nullable().optional(),
+  // Distance pricing
+  distanceRulesEnabled: z.boolean().optional(),
+  roadDistanceMultiplier: z.number().min(0.5).max(3).optional(),
+  // Subscription baseline (read on the subscription path only)
+  baseFee: z.number().min(0).optional(),
+  // Free-delivery threshold (non-subscriber path)
+  freeDeliveryEnabled: z.boolean().optional(),
+  freeDeliveryThreshold: z.number().min(0).nullable().optional(),
+  thresholdForNonSubscribers: z.boolean().optional(),
+});
+
 export async function updateSettings(req: AuthRequest, res: Response): Promise<void> {
   try {
-    const data = await svc.updateDeliverySettings(req.body);
+    const parsed = updateSettingsSchema.parse(req.body);
+    const data = await svc.updateDeliverySettings(parsed);
     ok(res, data);
   } catch (err) {
     badRequest(res, (err as Error).message);
