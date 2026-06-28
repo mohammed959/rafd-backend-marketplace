@@ -33,8 +33,10 @@ export async function requestOtp(mobile: string): Promise<{ code?: string }> {
 
   await sendOtp(mobile, code);
 
-  // Return code in dev so developers can test without an SMS gateway
-  return config.isDev ? { code } : {};
+  // Return the code so the marketplace can show the MVP login badge. Gated by
+  // `otp.exposeCode` (default ON) — also always on in dev. Turn off via
+  // OTP_EXPOSE_CODE=false once a real SMS gateway is in place.
+  return config.isDev || config.otp.exposeCode ? { code } : {};
 }
 
 export async function verifyOtp(

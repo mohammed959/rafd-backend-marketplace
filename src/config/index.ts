@@ -16,6 +16,12 @@ export const config = {
     // value (e.g. "123456") so testers can sign in without SMS. Unset in
     // production to restore random per-request OTPs.
     override: process.env.DEV_OTP_OVERRIDE?.trim() || null,
+    // MVP: return the generated OTP in the request-otp response so the
+    // marketplace can show it as a badge and testers can sign in without an
+    // SMS gateway. Defaults to ON (works in production too). Set
+    // OTP_EXPOSE_CODE=false once a real SMS provider is wired up so codes are
+    // no longer leaked to the client.
+    exposeCode: (process.env.OTP_EXPOSE_CODE ?? 'true').toLowerCase() !== 'false',
   },
   bunny: {
     // Products: ${productBaseUrl}/{sku}.${productExtension}
