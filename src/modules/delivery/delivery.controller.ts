@@ -53,6 +53,14 @@ export async function getBranch(_req: AuthRequest, res: Response): Promise<void>
   ok(res, data);
 }
 
+const latLngSchema = z.object({
+  lat: z.number().min(-90).max(90),
+  lng: z.number().min(-180).max(180),
+});
+// A polygon ring needs >= 3 vertices. `null` clears it; omitting it leaves
+// the stored value untouched.
+const polygonSchema = z.array(latLngSchema).min(3);
+
 const branchSchema = z.object({
   name: z.string().min(1),
   nameAr: z.string().min(1),
@@ -60,6 +68,8 @@ const branchSchema = z.object({
   latitude: z.number().min(-90).max(90),
   longitude: z.number().min(-180).max(180),
   phone: z.string().nullable().optional(),
+  deliveryPolygon: polygonSchema.nullable().optional(),
+  excludedPolygons: z.array(polygonSchema).nullable().optional(),
 });
 
 export async function upsertBranch(req: AuthRequest, res: Response): Promise<void> {

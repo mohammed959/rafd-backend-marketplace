@@ -24,6 +24,7 @@ import auditRoutes from './modules/audit/audit.routes';
 import bulkSkuRoutes from './modules/bulk-sku-update/bulkSku.routes';
 import checkoutRoutes from './modules/checkout/checkout.routes';
 import pickupRoutes from './modules/pickup/pickup.routes';
+import settingsRoutes from './modules/settings/settings.routes';
 
 const app = express();
 
@@ -70,6 +71,7 @@ app.use('/api/audit-logs', auditRoutes);
 app.use('/api/inventory-bulk', bulkSkuRoutes);
 app.use('/api/checkout', checkoutRoutes);
 app.use('/api/pickup', pickupRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // 404 handler
 app.use((_req, res) => {

@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE `branches` ADD COLUMN `deliveryPolygon` JSON NULL,
+    ADD COLUMN `excludedPolygons` JSON NULL;

@@ -1,5 +1,14 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
+import {
+  LatLng,
+  Polygon,
+  normalizePolygon,
+  normalizePolygons,
+  pointInPolygon,
+  pointInAnyPolygon,
+  isPolygonInsidePolygon,
+} from '../../lib/geo';
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371;
@@ -40,7 +49,11 @@ export interface DeliveryQuoteResult {
     | 'PICKUP_ONLY'
     | 'NO_LOCATION'
     | 'NO_RULES'
-    | 'NO_BRANCH';
+    | 'NO_BRANCH'
+    // Polygon coverage outcomes (replace radius-based OUT_OF_RANGE):
+    | 'OUT_OF_AREA'
+    | 'IN_EXCLUDED_AREA'
+    | 'AREA_NOT_CONFIGURED';
   matchedRule: {
     id: string;
     minKm: number;
@@ -200,27 +213,20 @@ async function computeDeliveryQuote(opts: QuoteOpts): Promise<DeliveryQuoteResul
     };
   }
 
-  const maxDeliveryKm = settings.maxDeliveryKm != null ? Number(settings.maxDeliveryKm) : null;
-  // Distance rules are now mandatory for non-subscribers — there is no flat-fee
-  // fallback. Subscribers can still order delivery (their benefit pays the fee).
-  if (maxDeliveryKm == null || !settings.distanceRulesEnabled) {
-    if (!hasActiveSubscription) {
-      return {
-        ...baseQuote,
-        reason: 'NO_RULES',
-        message: 'Home delivery is not configured yet. Pickup from Branch is available.',
-      };
-    }
-    // For subscribers we still need a max distance to gate by, otherwise we
-    // can't compute a meaningful eligibility window. Treat missing max as
-    // "delivery not yet set up".
-    if (maxDeliveryKm == null) {
-      return {
-        ...baseQuote,
-        reason: 'NO_RULES',
-        message: 'Home delivery is not configured yet. Pickup from Branch is available.',
-      };
-    }
+  // ── Polygon-based coverage (replaces radius / maxDeliveryKm) ──────
+  // The main delivery polygon defines the serviceable area; excluded
+  // polygons carve out unreachable zones inside it. Distance is still
+  // computed below, but ONLY for fee pricing (distance-rule tiers) — it no
+  // longer decides whether delivery is available.
+  const mainPolygon = normalizePolygon(branch.deliveryPolygon);
+  const excludedPolygons = normalizePolygons(branch.excludedPolygons);
+
+  if (!mainPolygon) {
+    return {
+      ...baseQuote,
+      reason: 'AREA_NOT_CONFIGURED',
+      message: 'Delivery area has not been configured yet. Pickup from Branch is available.',
+    };
   }
 
   const hasCustomerCoords = opts.customerLat != null && opts.customerLng != null;
@@ -234,8 +240,7 @@ async function computeDeliveryQuote(opts: QuoteOpts): Promise<DeliveryQuoteResul
       Number(branch.longitude),
     );
     straightLineKm = Math.round(raw * 100) / 100;
-    // Apply admin-controlled road-distance calibration. 1.00 = no change;
-    // 1.30–1.45 are common urban factors that approximate driving distance.
+    // Admin-controlled road-distance calibration — used for fee tiers only.
     distanceKm = Math.round(raw * roadDistanceMultiplier * 100) / 100;
   }
 
@@ -243,9 +248,7 @@ async function computeDeliveryQuote(opts: QuoteOpts): Promise<DeliveryQuoteResul
   baseQuote.straightLineKm = straightLineKm;
 
   if (distanceKm == null) {
-    // No customer location yet — checkout will prompt for it. We don't preview
-    // a fee, because there's no longer a flat fallback and the right fee
-    // depends on which rule range the customer ultimately lands in.
+    // No customer location yet — checkout will prompt for it.
     return {
       ...baseQuote,
       reason: 'NO_LOCATION',
@@ -253,20 +256,31 @@ async function computeDeliveryQuote(opts: QuoteOpts): Promise<DeliveryQuoteResul
     };
   }
 
-  // Hard max-distance gate — Phase 6: this check fires BEFORE the
-  // subscription path, so an out-of-range customer with an active
-  // subscription is still refused home delivery and must use pickup.
-  // Max delivery distance > subscription benefits, by design.
-  if (maxDeliveryKm != null && distanceKm > maxDeliveryKm) {
+  const customerPoint: LatLng = { lat: opts.customerLat!, lng: opts.customerLng! };
+
+  // Inside the main service area?
+  if (!pointInPolygon(customerPoint, mainPolygon)) {
     return {
       ...baseQuote,
-      reason: 'OUT_OF_RANGE',
+      reason: 'OUT_OF_AREA',
       outOfService: true,
-      message: 'Home delivery is unavailable for this address because it exceeds the maximum delivery distance.',
+      message:
+        'Home delivery is not available for this location — it is outside the delivery area. Pickup from Branch is available.',
     };
   }
 
-  // Within max distance ⇒ subscribable.
+  // Inside an excluded (unreachable) zone?
+  if (pointInAnyPolygon(customerPoint, excludedPolygons)) {
+    return {
+      ...baseQuote,
+      reason: 'IN_EXCLUDED_AREA',
+      outOfService: true,
+      message:
+        'Home delivery is not available for this location — it falls within an excluded area. Pickup from Branch is available.',
+    };
+  }
+
+  // Inside coverage ⇒ subscribable and deliverable; the fee is decided below.
   baseQuote.subscriptionEligible = true;
 
   // SUBSCRIPTION PATH — bypass distance rules, apply the plan's benefit.
@@ -289,6 +303,16 @@ async function computeDeliveryQuote(opts: QuoteOpts): Promise<DeliveryQuoteResul
   }
 
   // NON-SUBSCRIBER PATH — distance rules are the only pricing source.
+  // Coverage is already satisfied (polygon), but we still need a configured
+  // fee to charge. Without the distance-rule pricing toggle there's no fee
+  // to apply, so delivery can't be offered to non-subscribers.
+  if (!settings.distanceRulesEnabled) {
+    return {
+      ...baseQuote,
+      reason: 'NO_RULES',
+      message: 'Home delivery pricing is not configured yet. Pickup from Branch is available.',
+    };
+  }
 
   // (a) Free-delivery threshold short-circuit, if admin enabled it for non-subs.
   if (
@@ -434,6 +458,8 @@ export async function getBranch() {
       latitude: Number(branch.latitude),
       longitude: Number(branch.longitude),
       phone: branch.phone,
+      deliveryPolygon: normalizePolygon(branch.deliveryPolygon),
+      excludedPolygons: normalizePolygons(branch.excludedPolygons),
     },
   };
 }
@@ -445,9 +471,67 @@ export interface UpsertBranchInput {
   latitude: number;
   longitude: number;
   phone?: string | null;
+  /** Main delivery service area. `null` clears it (delivery becomes
+   *  unavailable). `undefined` leaves the stored value untouched. */
+  deliveryPolygon?: LatLng[] | null;
+  /** Excluded zones inside the main area. */
+  excludedPolygons?: LatLng[][] | null;
+}
+
+/**
+ * Validate and normalize the polygon payload, returning the Prisma `data`
+ * fields to write. Throws on malformed geometry so the controller can turn
+ * it into a 400. Excluded rings must sit inside the main polygon.
+ */
+function buildPolygonData(input: UpsertBranchInput): {
+  deliveryPolygon?: Prisma.InputJsonValue | typeof Prisma.JsonNull;
+  excludedPolygons?: Prisma.InputJsonValue | typeof Prisma.JsonNull;
+} {
+  const data: {
+    deliveryPolygon?: Prisma.InputJsonValue | typeof Prisma.JsonNull;
+    excludedPolygons?: Prisma.InputJsonValue | typeof Prisma.JsonNull;
+  } = {};
+
+  // Main polygon: undefined = leave as-is; null/empty = clear; array = set.
+  let mainPolygon: Polygon | null = null;
+  if (input.deliveryPolygon !== undefined) {
+    if (input.deliveryPolygon === null || input.deliveryPolygon.length === 0) {
+      data.deliveryPolygon = Prisma.JsonNull;
+    } else {
+      const normalized = normalizePolygon(input.deliveryPolygon);
+      if (!normalized) {
+        throw new Error('Delivery area must be a polygon with at least 3 points.');
+      }
+      mainPolygon = normalized;
+      data.deliveryPolygon = normalized as unknown as Prisma.InputJsonValue;
+    }
+  }
+
+  // Excluded polygons: each must be a valid ring inside the main polygon.
+  if (input.excludedPolygons !== undefined) {
+    if (input.excludedPolygons === null || input.excludedPolygons.length === 0) {
+      data.excludedPolygons = Prisma.JsonNull;
+    } else {
+      const rings: Polygon[] = [];
+      for (const [i, raw] of input.excludedPolygons.entries()) {
+        const ring = normalizePolygon(raw);
+        if (!ring) {
+          throw new Error(`Excluded area ${i + 1} must be a polygon with at least 3 points.`);
+        }
+        if (mainPolygon && !isPolygonInsidePolygon(ring, mainPolygon)) {
+          throw new Error(`Excluded area ${i + 1} must be fully inside the delivery area.`);
+        }
+        rings.push(ring);
+      }
+      data.excludedPolygons = rings as unknown as Prisma.InputJsonValue;
+    }
+  }
+
+  return data;
 }
 
 export async function upsertBranch(input: UpsertBranchInput) {
+  const polygonData = buildPolygonData(input);
   const existing = await prisma.branch.findFirst({ where: { isActive: true } });
   if (existing) {
     return prisma.branch.update({
@@ -459,6 +543,7 @@ export async function upsertBranch(input: UpsertBranchInput) {
         latitude: input.latitude,
         longitude: input.longitude,
         phone: input.phone ?? null,
+        ...polygonData,
       },
     });
   }
@@ -471,6 +556,7 @@ export async function upsertBranch(input: UpsertBranchInput) {
       longitude: input.longitude,
       phone: input.phone ?? null,
       isActive: true,
+      ...polygonData,
     },
   });
 }

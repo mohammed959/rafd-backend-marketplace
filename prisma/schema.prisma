@@ -189,6 +189,15 @@ model Branch {
   longitude Decimal  @db.Decimal(11, 8)
   phone     String?
   isActive  Boolean  @default(true)
+
+  // Polygon-based delivery coverage. `deliveryPolygon` is the main service
+  // area as an array of {lat,lng} vertices; `excludedPolygons` is an array
+  // of such rings carved out of it (sea, restricted/unreachable zones).
+  // When `deliveryPolygon` is null/empty, home delivery is unavailable —
+  // this replaces the old radius (maxDeliveryKm) coverage model.
+  deliveryPolygon  Json?
+  excludedPolygons Json?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -664,6 +673,18 @@ model MinimumOrderSettings {
   updatedAt     DateTime @updatedAt
 
   @@map("minimum_order_settings")
+}
+
+// Homepage / storefront presentation settings. Singleton row (one exists
+// at a time) — see settings.service.ts for the get-or-create helper.
+model HomeSettings {
+  id               String   @id @default(cuid())
+  // Number of products rendered in the homepage "All Products" strip.
+  // Capped at 100 by the products API; keep this in range.
+  allProductsLimit Int      @default(20)
+  updatedAt        DateTime @updatedAt
+
+  @@map("home_settings")
 }
 
 // ─── Banners ──────────────────────────────────────────────────────
