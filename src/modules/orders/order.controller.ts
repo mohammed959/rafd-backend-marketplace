@@ -365,6 +365,26 @@ export async function verifyPayment(req: AuthRequest, res: Response): Promise<vo
   }
 }
 
+const MAX_DELIVERY_IMAGES = 3;
+
+export async function updateDeliveryImages(req: AuthRequest, res: Response): Promise<void> {
+  const { images } = (req.body ?? {}) as { images?: unknown };
+  if (!Array.isArray(images) || !images.every((i) => typeof i === 'string')) {
+    badRequest(res, 'images must be an array of URLs');
+    return;
+  }
+  if (images.length > MAX_DELIVERY_IMAGES) {
+    badRequest(res, `A maximum of ${MAX_DELIVERY_IMAGES} images is allowed.`);
+    return;
+  }
+  try {
+    const data = await svc.updateDeliveryImages(req.user!.userId, req.params.id, images as string[]);
+    ok(res, data, 'Delivery location images updated');
+  } catch (err) {
+    badRequest(res, (err as Error).message);
+  }
+}
+
 export async function uploadPaymentProof(req: AuthRequest, res: Response): Promise<void> {
   const { proofUrl } = req.body as { proofUrl?: string };
   if (!proofUrl || typeof proofUrl !== 'string') {

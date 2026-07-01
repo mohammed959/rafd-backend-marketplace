@@ -50,6 +50,20 @@ export const config = {
     defaultBrandImageUrl:
       process.env.DEFAULT_BRAND_IMAGE_URL ??
       'https://your-zone.b-cdn.net/brand/default/default.png',
+
+    // ── Storage Zone (writable) — customer-uploaded images ───────────
+    // Uploads go via HTTP PUT to the Storage Zone; served back over the
+    // public Pull Zone. See lib/bunnyStorage.ts. Host depends on the zone's
+    // primary region (default main region = storage.bunnycdn.com).
+    storageHost: process.env.BUNNY_STORAGE_HOST ?? 'storage.bunnycdn.com',
+    storageZone: process.env.BUNNY_STORAGE_ZONE_NAME ?? '',
+    storageAccessKey: process.env.BUNNY_STORAGE_ACCESS_KEY ?? '',
+    // Public CDN root whose origin is the Storage Zone above.
+    publicBaseUrl: stripTrailingSlash(
+      process.env.BUNNY_PUBLIC_BASE_URL ?? 'https://apprafed.b-cdn.net'
+    ),
+    // Folder inside the Storage Zone for customer uploads (no slashes).
+    customerFolder: (process.env.BUNNY_CUSTOMER_UPLOAD_FOLDER ?? 'Customers').replace(/^\/+|\/+$/g, ''),
   },
   isDev: (process.env.NODE_ENV ?? 'development') === 'development',
 };

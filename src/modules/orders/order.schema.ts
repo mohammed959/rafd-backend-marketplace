@@ -8,6 +8,8 @@ export const createOrderSchema = z.object({
   replacementPreference: z.string().optional(),
   deliveryLat: z.number().min(-90).max(90).optional(),
   deliveryLng: z.number().min(-180).max(180).optional(),
+  // Up to 3 delivery-location photo URLs (already uploaded to Bunny).
+  deliveryImages: z.array(z.string().url()).max(3).optional(),
   // Scheduled pickup. Only meaningful when fulfillmentType=PICKUP. Server
   // re-validates feature toggle, slot capacity, cutoff, range, etc.
   pickupType: z.enum(['ASAP', 'SCHEDULED']).optional(),

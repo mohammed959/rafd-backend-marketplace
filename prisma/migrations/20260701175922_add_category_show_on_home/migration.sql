@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE `categories` ADD COLUMN `showOnHome` BOOLEAN NOT NULL DEFAULT true;

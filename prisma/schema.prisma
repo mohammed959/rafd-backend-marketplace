@@ -214,6 +214,9 @@ model Category {
   imageUrl      String?       @db.Text
   sortOrder     Int           @default(0)
   isActive      Boolean       @default(true)
+  // Home visibility. Independent of isActive: an active category can still be
+  // hidden from the marketplace home while remaining listed in /categories.
+  showOnHome    Boolean       @default(true)
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 
@@ -363,6 +366,10 @@ model Order {
   deliveryLat     Decimal?      @db.Decimal(10, 8)
   deliveryLng     Decimal?      @db.Decimal(11, 8)
   distanceKm      Decimal?      @db.Decimal(8, 2)
+  // Up to 3 customer-provided delivery-location photos (Bunny CDN URLs) so
+  // the driver can find the exact spot. Stored as a JSON array of URL
+  // strings — the images themselves live in Bunny, not the DB.
+  deliveryImages  Json?
   subscriptionApplied Boolean   @default(false)
   rejectionReason String?
 

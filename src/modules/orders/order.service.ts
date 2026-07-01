@@ -226,6 +226,8 @@ export async function createOrder(customerId: string, input: CreateOrderInput) {
         deliveryLat: isPickup ? undefined : resolvedLat,
         deliveryLng: isPickup ? undefined : resolvedLng,
         distanceKm: isPickup ? undefined : quote.distanceKm ?? undefined,
+        deliveryImages:
+          isPickup || !input.deliveryImages?.length ? undefined : input.deliveryImages,
         subscriptionApplied: quote.pricingRuleApplied === 'SUBSCRIPTION',
         pickupType: scheduledFields.pickupType,
         scheduledPickupDate: scheduledFields.scheduledPickupDate,
@@ -508,6 +510,28 @@ export async function attachPaymentProof(customerId: string, orderId: string, pr
     return u;
   });
   return updated;
+}
+
+/**
+ * Replace the delivery-location images on a customer's own order. Images are
+ * already-uploaded Bunny CDN URLs (see uploads module). Delivery orders only;
+ * an empty array clears them. The customer can update these any time so the
+ * driver always sees the latest.
+ */
+export async function updateDeliveryImages(
+  customerId: string,
+  orderId: string,
+  images: string[],
+) {
+  const order = await prisma.order.findFirst({ where: { id: orderId, customerId } });
+  if (!order) throw new Error('Order not found');
+  if (order.fulfillmentType !== 'DELIVERY') {
+    throw new Error('Location images apply to delivery orders only.');
+  }
+  return prisma.order.update({
+    where: { id: orderId },
+    data: { deliveryImages: images.length ? images : Prisma.JsonNull },
+  });
 }
 
 /**

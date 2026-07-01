@@ -1,8 +1,12 @@
 import { prisma } from '../../lib/prisma';
 
-export async function getCategories(activeOnly = true) {
+export async function getCategories(activeOnly = true, homeOnly = false) {
   return prisma.category.findMany({
-    where: activeOnly ? { isActive: true } : {},
+    where: {
+      ...(activeOnly ? { isActive: true } : {}),
+      // Home strip only: active AND flagged to show on home.
+      ...(homeOnly ? { showOnHome: true } : {}),
+    },
     include: {
       subcategories: {
         where: activeOnly ? { isActive: true } : {},
@@ -26,6 +30,7 @@ export async function createCategory(data: {
   slug: string;
   imageUrl?: string;
   sortOrder?: number;
+  showOnHome?: boolean;
 }) {
   return prisma.category.create({ data });
 }
@@ -37,6 +42,7 @@ export async function updateCategory(id: string, data: Partial<{
   imageUrl: string;
   sortOrder: number;
   isActive: boolean;
+  showOnHome: boolean;
 }>) {
   return prisma.category.update({ where: { id }, data });
 }

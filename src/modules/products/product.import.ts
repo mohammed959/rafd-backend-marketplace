@@ -7,8 +7,8 @@ import { logAction } from '../audit/audit.service';
  * accepted; price, quantity, SKU and barcode are product-level columns.
  *
  * Spec columns (case-insensitive, whitespace/underscore tolerant):
- *   Required: name, nameAr, brand (slug), category (slug), sku, price, quantity
- *   Optional: description, descriptionAr, subcategory (slug), barcode, featured
+ *   Required: name, nameAr, brand (slug), category (slug or name), sku, price, quantity
+ *   Optional: description, descriptionAr, subcategory (slug or name), barcode, featured
  *
  * Header aliases below let operators paste from a variety of
  * spreadsheets while still mapping to a single canonical field.
@@ -159,23 +159,46 @@ export async function importProductsFromExcel(buffer: Buffer, actorId: string): 
   const rows = await parseSheet(buffer);
   const errors: ImportRowError[] = [];
 
-  // Resolve all referenced slugs in bulk.
-  const categorySlugs = new Set<string>();
-  const subcategorySlugs = new Set<string>();
+  // Brands are resolved by slug in bulk.
   const brandSlugs = new Set<string>();
   for (const row of rows) {
-    if (row.categorySlug) categorySlugs.add(row.categorySlug.toLowerCase());
-    if (row.subcategorySlug) subcategorySlugs.add(row.subcategorySlug.toLowerCase());
     if (row.brandSlug) brandSlugs.add(row.brandSlug.toLowerCase());
   }
-  const [foundCategories, foundSubcategories, foundBrands] = await Promise.all([
-    prisma.category.findMany({ where: { slug: { in: Array.from(categorySlugs) } } }),
-    prisma.subcategory.findMany({ where: { slug: { in: Array.from(subcategorySlugs) } } }),
-    prisma.brand.findMany({ where: { slug: { in: Array.from(brandSlugs) } } }),
-  ]);
-  const catBySlug = new Map(foundCategories.map((c) => [c.slug.toLowerCase(), c]));
-  const subBySlug = new Map(foundSubcategories.map((s) => [s.slug.toLowerCase(), s]));
+  const foundBrands = await prisma.brand.findMany({ where: { slug: { in: Array.from(brandSlugs) } } });
   const brandBySlug = new Map(foundBrands.map((b) => [b.slug.toLowerCase(), b]));
+
+  // Categories are matched by slug, English name, or Arabic name
+  // (case-insensitive, trimmed) so operators can reference an existing
+  // category by its human name, not only its slug. The categories table is
+  // small, so load it once and build a reference map. First writer wins per
+  // key, with slug taking precedence over names.
+  const allCategories = await prisma.category.findMany();
+  const catByRef = new Map<string, (typeof allCategories)[number]>();
+  for (const c of allCategories) {
+    for (const key of [c.slug, c.name, c.nameAr]) {
+      const k = key.trim().toLowerCase();
+      if (k && !catByRef.has(k)) catByRef.set(k, c);
+    }
+  }
+
+  // Subcategories are matched WITHIN their parent category by slug, English
+  // name, or Arabic name (case-insensitive). Load only the subcategories of
+  // the categories actually referenced in the file.
+  const referencedCatIds = new Set<string>();
+  for (const row of rows) {
+    if (!row.categorySlug) continue;
+    const c = catByRef.get(row.categorySlug.trim().toLowerCase());
+    if (c) referencedCatIds.add(c.id);
+  }
+  const foundSubcategories = await prisma.subcategory.findMany({
+    where: { categoryId: { in: Array.from(referencedCatIds) } },
+  });
+  const subsByCategory = new Map<string, typeof foundSubcategories>();
+  for (const s of foundSubcategories) {
+    const list = subsByCategory.get(s.categoryId);
+    if (list) list.push(s);
+    else subsByCategory.set(s.categoryId, [s]);
+  }
 
   // SKU conflict check across the file + DB.
   const fileSkus = rows.map((r) => r.sku?.trim()).filter((s): s is string => Boolean(s));
@@ -211,7 +234,7 @@ export async function importProductsFromExcel(buffer: Buffer, actorId: string): 
       errors.push({ rowNumber: row.rowNumber, field: 'category', message: 'Category is required' });
       continue;
     }
-    const cat = catBySlug.get(row.categorySlug.toLowerCase());
+    const cat = catByRef.get(row.categorySlug.trim().toLowerCase());
     if (!cat) {
       errors.push({ rowNumber: row.rowNumber, field: 'category', message: `Category "${row.categorySlug}" not found — create it before importing.` });
       continue;
@@ -232,20 +255,25 @@ export async function importProductsFromExcel(buffer: Buffer, actorId: string): 
       continue;
     }
 
-    // Subcategory — optional. If provided, must exist AND belong to the
-    // chosen category so we never store a mismatched (cat, subcat) pair.
+    // Subcategory — optional. When provided, match it against the chosen
+    // category's subcategories by slug, English name, or Arabic name. Scoping
+    // the match to the category guarantees a valid (category, subcategory)
+    // pair and lets operators reference a subcategory by its display name.
     let subId: string | null = null;
     if (row.subcategorySlug) {
-      const sub = subBySlug.get(row.subcategorySlug.toLowerCase());
+      const ref = row.subcategorySlug.trim().toLowerCase();
+      const candidates = subsByCategory.get(cat.id) ?? [];
+      const sub = candidates.find(
+        (s) =>
+          s.slug.toLowerCase() === ref ||
+          s.name.trim().toLowerCase() === ref ||
+          s.nameAr.trim().toLowerCase() === ref,
+      );
       if (!sub) {
-        errors.push({ rowNumber: row.rowNumber, field: 'subcategory', message: `Subcategory "${row.subcategorySlug}" not found.` });
-        continue;
-      }
-      if (sub.categoryId !== cat.id) {
         errors.push({
           rowNumber: row.rowNumber,
           field: 'subcategory',
-          message: `Subcategory "${row.subcategorySlug}" does not belong to category "${row.categorySlug}".`,
+          message: `Subcategory "${row.subcategorySlug}" was not found in category "${row.categorySlug}".`,
         });
         continue;
       }
@@ -299,7 +327,8 @@ export async function importProductsFromExcel(buffer: Buffer, actorId: string): 
           subcategoryId: subId,
           brandId: brand.id,
           sku,
-          barcode: row.barcode?.trim(),
+          // Fully optional — empty stays null (no validation, non-unique).
+          barcode: row.barcode?.trim() || null,
           price: row.price,
           stock: Math.floor(row.quantity),
         },
@@ -330,9 +359,9 @@ export async function buildSampleTemplate(): Promise<Buffer> {
     { header: 'nameAr',          key: 'nameAr',          width: 28 },
     // Required classification
     { header: 'brandSlug',       key: 'brandSlug',       width: 18 },
-    { header: 'categorySlug',    key: 'categorySlug',    width: 18 },
+    { header: 'category',        key: 'categorySlug',    width: 18 },
     // Optional classification
-    { header: 'subcategorySlug', key: 'subcategorySlug', width: 18 },
+    { header: 'subcategory',     key: 'subcategorySlug', width: 18 },
     // Optional descriptions
     { header: 'description',     key: 'description',     width: 30 },
     { header: 'descriptionAr',   key: 'descriptionAr',   width: 30 },
@@ -350,8 +379,8 @@ export async function buildSampleTemplate(): Promise<Buffer> {
     name: 'Almarai Milk 1L',
     nameAr: 'حليب المراعي 1 لتر',
     brandSlug: 'almarai',
-    categorySlug: 'dairy',
-    subcategorySlug: 'milk',
+    categorySlug: 'Dairy',
+    subcategorySlug: 'Milk',
     description: 'Long life full-fat milk',
     descriptionAr: 'حليب طويل العمر كامل الدسم',
     sku: 'MLK-1L',
@@ -366,7 +395,7 @@ export async function buildSampleTemplate(): Promise<Buffer> {
     name: 'Basic Soap Bar',
     nameAr: 'صابون أساسي',
     brandSlug: 'generic',
-    categorySlug: 'household',
+    categorySlug: 'Household',
     sku: 'SOAP-BAR',
     price: 3,
     quantity: 50,

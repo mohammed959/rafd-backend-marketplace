@@ -30,6 +30,7 @@ router.post('/', authenticateCustomer, asyncHandler(ctrl.create));
 router.post('/:id/reorder', authenticateCustomer, asyncHandler(ctrl.reorder));
 router.post('/:id/cancel', authenticateCustomer, asyncHandler(ctrl.cancelOwn));
 router.post('/:id/payment-proof', authenticateCustomer, asyncHandler(ctrl.uploadPaymentProof));
+router.patch('/:id/delivery-images', authenticateCustomer, asyncHandler(ctrl.updateDeliveryImages));
 
 // Optional curbside car details. Customer-scoped.
 router.patch('/:id/car-pickup-details',
